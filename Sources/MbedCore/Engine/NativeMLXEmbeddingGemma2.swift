@@ -3,7 +3,8 @@ import AVFoundation
 import CoreImage
 import Foundation
 
-#if canImport(MLXVLM) && canImport(MLXLMCommon)
+#if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
+import MLXHuggingFace
 import MLXLMCommon
 import MLXVLM
 #endif
@@ -150,60 +151,141 @@ public enum NativeMLXEmbeddingGemma2 {
         }
         return Matryoshka.project(sum, dimensions: dimensions)
     }
+    public static var isAvailableInProcess: Bool {
+        #if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
+        return true
+        #else
+        return false
+        #endif
+    }
 }
 
-#if canImport(MLXVLM) && canImport(MLXLMCommon)
+#if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
 /// In-process `EmbeddingEngine` backed directly by `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding`.
 ///
-/// When `mbed` is linked with local `/Users/fredbliss/mlx/mlx-swift` and `/Users/fredbliss/mlx/mlx-swift-lm`,
-/// this engine runs `embeddinggemma-2-MLX-BF16` completely in-process with zero Python or HTTP overhead,
-/// and uses `WindowPlanner` + `UserInput.Video.frames(...)` to embed 32-second video windows.
+/// When `mbed` is linked with local `/Users/fredbliss/mlx/mlx-swift` and `/Users/fredbliss/mlx/mlx-swift-lm`
+/// (`MBED_ENABLE_NATIVE_MLX=1`), this engine runs `embeddinggemma-2-MLX-BF16` completely in-process
+/// with zero Python or HTTP overhead, and uses `WindowPlanner` + `UserInput.Video.frames(...)` to
+/// embed 32-second video windows (`16s` overlapping stride, `fps` or duration-scaled `content`).
 public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     public nonisolated let modelID: String
+    public nonisolated let checkpointURL: URL
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
-    private let embedder: MLXVLM.EmbeddingGemma2Embedding
+    private let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
+    private let customTokenizerLoader: (any TokenizerLoader)?
+    private var cachedEmbedder: MLXVLM.EmbeddingGemma2Embedding?
 
+    /// Synchronous initializer used by `MbedApp` and `MbedCLI`; loads the model weights and
+    /// tokenizer lazily on the first `embedBatch` call (`componentLoading: .onFirstUse`).
+    public init(
+        checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
+        tokenizerLoader: (any TokenizerLoader)? = nil
+    ) {
+        self.checkpointURL = checkpointURL
+        self.modelID = checkpointURL.lastPathComponent
+        self.customTokenizerLoader = tokenizerLoader
+        self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: checkpointURL))
+            ?? Self.fallbackDescriptor
+    }
+
+    /// Eager async initializer when the caller wants to pre-load `MLXVLM.EmbeddingGemma2Embedding` upfront.
     public init(
         modelDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
         tokenizerLoader: any TokenizerLoader
     ) async throws {
+        self.checkpointURL = modelDirectory
         self.modelID = modelDirectory.lastPathComponent
-        self.embedder = try await MLXVLM.EmbeddingGemma2Embedding(
+        self.customTokenizerLoader = tokenizerLoader
+        self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: modelDirectory))
+            ?? Self.fallbackDescriptor
+        self.cachedEmbedder = try await MLXVLM.EmbeddingGemma2Embedding(
             modelDirectory: modelDirectory,
             tokenizerLoader: tokenizerLoader,
             componentLoading: .onFirstUse
         )
     }
 
+    private func resolvedEmbedder() async throws -> MLXVLM.EmbeddingGemma2Embedding {
+        if let cachedEmbedder {
+            return cachedEmbedder
+        }
+        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader
+        let loaded = try await MLXVLM.EmbeddingGemma2Embedding(
+            modelDirectory: checkpointURL,
+            tokenizerLoader: loader,
+            componentLoading: .onFirstUse
+        )
+        self.cachedEmbedder = loaded
+        return loaded
+    }
+
+    private static let fallbackDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(
+        modelType: "embedding_gemma2",
+        hiddenSize: 512,
+        embeddingDim: 768,
+        numHiddenLayers: 24,
+        maxInputTokens: 8192,
+        videoFPS: 1.0,
+        videoMaxFrames: 32,
+        videoMaxSoftTokens: 140,
+        imageMaxSoftTokens: 280,
+        prompts: [:],
+        poolingModeMeanTokens: true
+    )
+
     public func embedBatch(
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
     ) async throws -> [EmbeddedOutput] {
+        let embedder = try await resolvedEmbedder()
         var outputs: [EmbeddedOutput] = []
         outputs.reserveCapacity(inputs.count)
 
         for item in inputs {
+            try Task.checkCancellation()
             let vlmTask = Self.mapTask(item.task)
             var vlmParts: [MLXVLM.EmbeddingInput.Part] = []
+            var tempURLs: [URL] = []
+            defer {
+                for url in tempURLs {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+
+            var windowedVideoRequest: (url: URL, sampling: VideoWindowSampling)?
+            var hasCompanionAudio = false
 
             for part in item.parts {
                 switch part {
                 case .text(let s):
                     vlmParts.append(.text(s))
-                case let .media(kind, _, data, _):
-                    let tempURL = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("mbed-\(UUID().uuidString).\(Self.ext(for: kind))")
-                    try data.write(to: tempURL)
-                    defer { try? FileManager.default.removeItem(at: tempURL) }
+                case let .media(kind, _, data, url, windowSampling):
+                    let resolvedURL: URL
+                    if let url {
+                        resolvedURL = url
+                    } else if let data {
+                        let tempURL = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("mbed-\(UUID().uuidString).\(Self.ext(for: kind))")
+                        try data.write(to: tempURL)
+                        tempURLs.append(tempURL)
+                        resolvedURL = tempURL
+                    } else {
+                        continue
+                    }
+
                     switch kind {
                     case .image:
-                        vlmParts.append(.image(.url(tempURL)))
+                        vlmParts.append(.image(.url(resolvedURL)))
                     case .video:
-                        vlmParts.append(.video(.url(tempURL)))
+                        vlmParts.append(.video(.url(resolvedURL)))
+                        if windowSampling != .off && windowedVideoRequest == nil {
+                            windowedVideoRequest = (resolvedURL, windowSampling)
+                        }
                     case .audio:
-                        vlmParts.append(.audio(.url(tempURL)))
+                        vlmParts.append(.audio(.url(resolvedURL)))
+                        hasCompanionAudio = true
                     default:
                         break
                     }
@@ -211,19 +293,118 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             }
 
             let primary = try await embedder.embed(
-                MLXVLM.EmbeddingInput(vlmParts),
+                MLXVLM.EmbeddingInput(vlmParts, title: item.title),
                 task: vlmTask,
                 dimensions: dimensions
             )
-            outputs.append(EmbeddedOutput(vector: primary, windows: []))
+
+            var windowVectors: [EmbeddedOutput.WindowVector] = []
+            if let (videoURL, sampling) = windowedVideoRequest {
+                windowVectors = try await embedVideoWindows(
+                    embedder: embedder,
+                    videoURL: videoURL,
+                    sampling: sampling,
+                    includeAudio: hasCompanionAudio,
+                    task: vlmTask,
+                    dimensions: dimensions
+                )
+            }
+            outputs.append(EmbeddedOutput(vector: primary, windows: windowVectors))
         }
         return outputs
+    }
+
+    private func embedVideoWindows(
+        embedder: MLXVLM.EmbeddingGemma2Embedding,
+        videoURL: URL,
+        sampling: VideoWindowSampling,
+        includeAudio: Bool,
+        task: MLXVLM.EmbeddingTask,
+        dimensions: Int?
+    ) async throws -> [EmbeddedOutput.WindowVector] {
+        let candidates = try await ArtifactProcessor.extractVideoCandidates(
+            for: videoURL,
+            sampling: sampling
+        )
+        let planned = WindowPlanner.planWindows(
+            times: candidates.times,
+            duration: candidates.duration,
+            windowSeconds: descriptor.maxWindowSeconds,
+            strideSeconds: descriptor.maxWindowSeconds / 2.0,
+            sampling: sampling,
+            fps: descriptor.videoFPS,
+            maxFrames: descriptor.videoMaxFrames,
+            thumbnails: candidates.thumbnails
+        )
+        guard planned.count > 1 else { return [] }
+
+        let pcmSamples: [Float] = includeAudio
+            ? ((try? await ArtifactProcessor.decodeMonoPCM(for: videoURL)) ?? [])
+            : []
+
+        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)
+        let ciOptions: [CIImageOption: Any] = sRGB.map { [.colorSpace: $0] } ?? [:]
+        var out: [EmbeddedOutput.WindowVector] = []
+        out.reserveCapacity(planned.count)
+
+        for win in planned {
+            try Task.checkCancellation()
+            let decoded = try await ArtifactProcessor.decodeVideoFrames(
+                for: videoURL,
+                at: win.frameTimes
+            )
+            guard !decoded.isEmpty else { continue }
+            let videoFrames = decoded.map { frame in
+                UserInput.VideoFrame(
+                    image: .ciImage(CIImage(cgImage: frame.image, options: ciOptions)),
+                    timeStamp: CMTime(seconds: frame.time, preferredTimescale: 90_000)
+                )
+            }
+            var winParts: [MLXVLM.EmbeddingInput.Part] = [.video(.frames(videoFrames))]
+            var tempAudioURL: URL?
+            defer {
+                if let tempAudioURL {
+                    try? FileManager.default.removeItem(at: tempAudioURL)
+                }
+            }
+            if !pcmSamples.isEmpty,
+               let sliceWAV = ArtifactProcessor.encodeAudioSliceWAV(
+                   samples: pcmSamples,
+                   sampleRate: ArtifactProcessor.audioSampleRate,
+                   startSeconds: win.start,
+                   endSeconds: min(win.end, win.start + ArtifactProcessor.audioWindowSeconds)
+               ) {
+                let wavURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mbed-win-audio-\(UUID().uuidString).wav")
+                if (try? sliceWAV.write(to: wavURL)) != nil {
+                    tempAudioURL = wavURL
+                    winParts.append(.text(" "))
+                    winParts.append(.audio(.url(wavURL)))
+                }
+            }
+            let vec = try await embedder.embed(
+                MLXVLM.EmbeddingInput(winParts),
+                task: task,
+                dimensions: dimensions
+            )
+            out.append(
+                EmbeddedOutput.WindowVector(
+                    start: win.start,
+                    end: win.end,
+                    frameTimes: decoded.map { ($0.time * 1000).rounded() / 1000 },
+                    vector: vec
+                )
+            )
+        }
+        return out
     }
 
     private static func mapTask(_ task: EmbeddingTask) -> MLXVLM.EmbeddingTask {
         switch task {
         case .query, .retrievalQuery: return .searchQuery
         case .document, .retrievalDocument: return .document
+        case .questionAnswering: return .questionAnswering
+        case .factVerification: return .factChecking
         case .sts: return .sentenceSimilarity
         case .clustering: return .clustering
         case .classification: return .classification

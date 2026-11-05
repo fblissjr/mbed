@@ -7,22 +7,32 @@ import UniformTypeIdentifiers
 @MainActor
 @Observable
 final class MbedViewModel {
+    var selectedBackend: EngineBackend = .heylook
     var serverURLString: String = "http://127.0.0.1:8000"
+    var checkpointPath: String = NativeMLXEmbeddingGemma2.defaultCheckpointURL.path
+    var serverCapabilities: HeylookServerCapabilities?
     var queryText: String = ""
     var queryAttachmentURL: URL?
     var selectedDimensions: Int = 768
     var selectedSampling: VideoWindowSampling = .fps
+    var loadAudioFromVideo: Bool = false
     var selectedKindFilter: ArtifactKind?
+    var selectedTaskOverride: EmbeddingTask?
     var hits: [SearchHit] = []
     var selectedHit: SearchHit?
     var selectedSpanIndex: Int = 0
     var statusMessage: String = "Ready"
     var isBusy: Bool = false
+    var isIndexing: Bool = false
     var artifactCount: Int = 0
     var chunkCount: Int = 0
+    var watchedFolders: [VectorStore.WatchedFolder] = []
 
     private var store: VectorStore?
+    private var engine: (any EmbeddingEngine)?
     private var coordinator: IndexCoordinator?
+    private var indexTask: Task<Void, Never>?
+    private var folderWatcher: FolderWatcher?
 
     init() {
         setupCoordinator()
@@ -38,12 +48,34 @@ final class MbedViewModel {
             ).appendingPathComponent("mbed", isDirectory: true)
             try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
             let dbURL = appSupport.appendingPathComponent("mbed.sqlite3")
-            let vectorStore = try VectorStore(databaseURL: dbURL)
-            let baseURL = URL(string: serverURLString) ?? URL(string: "http://127.0.0.1:8000")!
-            let engine = HeylookMLXEngine(baseURL: baseURL)
+            let vectorStore = try store ?? VectorStore(databaseURL: dbURL)
             self.store = vectorStore
-            self.coordinator = IndexCoordinator(engine: engine, store: vectorStore)
+
+            let activeEngine: any EmbeddingEngine
+            switch selectedBackend {
+            case .heylook:
+                let baseURL = URL(string: serverURLString) ?? URL(string: "http://127.0.0.1:8000")!
+                let heylook = HeylookMLXEngine(baseURL: baseURL)
+                activeEngine = heylook
+                Task {
+                    self.serverCapabilities = try? await heylook.fetchCapabilities()
+                }
+            case .nativeMLX:
+                #if canImport(MLXVLM)
+                activeEngine = MLXSwiftLMEmbeddingGemma2Engine(
+                    checkpointURL: URL(fileURLWithPath: checkpointPath)
+                )
+                #else
+                let baseURL = URL(string: serverURLString) ?? URL(string: "http://127.0.0.1:8000")!
+                activeEngine = HeylookMLXEngine(baseURL: baseURL)
+                statusMessage = "Native MLX not linked (build with MBED_ENABLE_NATIVE_MLX=1); using heylook HTTP."
+                #endif
+            }
+
+            self.engine = activeEngine
+            self.coordinator = IndexCoordinator(engine: activeEngine, store: vectorStore)
             refreshCounts()
+            refreshWatchedFolders()
         } catch {
             statusMessage = "Store init failed: \(error.localizedDescription)"
         }
@@ -55,24 +87,81 @@ final class MbedViewModel {
         chunkCount = stats.chunkCount
     }
 
+    func refreshWatchedFolders() {
+        guard let store, let folders = try? store.listWatchedFolders() else { return }
+        watchedFolders = folders
+        let folderURLs = folders.map(\.url)
+        if folderWatcher == nil {
+            folderWatcher = FolderWatcher { [weak self] changedDirs in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.isIndexing else { return }
+                    self.startIndexing(changedDirs, persistFolders: false)
+                }
+            }
+        }
+        folderWatcher?.watch(urls: folderURLs)
+    }
+
+    func removeWatchedFolder(_ folder: VectorStore.WatchedFolder) {
+        guard let store else { return }
+        try? store.removeWatchedFolder(folder.url)
+        refreshWatchedFolders()
+    }
+
+    func reindexWatchedFolders() {
+        let urls = watchedFolders.map(\.url)
+        guard !urls.isEmpty else { return }
+        startIndexing(urls, persistFolders: false)
+    }
+
+    func startIndexing(_ urls: [URL], persistFolders: Bool = true) {
+        indexTask?.cancel()
+        if persistFolders, let store {
+            for url in urls {
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                    try? store.addWatchedFolder(url, windowSampling: selectedSampling)
+                }
+            }
+            refreshWatchedFolders()
+        }
+        indexTask = Task {
+            await indexURLs(urls)
+        }
+    }
+
+    func cancelIndexing() {
+        indexTask?.cancel()
+        indexTask = nil
+        isIndexing = false
+        isBusy = false
+        statusMessage = "Indexing cancelled."
+    }
+
     func indexURLs(_ urls: [URL]) async {
         guard let coordinator else { return }
         isBusy = true
+        isIndexing = true
         defer {
             isBusy = false
+            isIndexing = false
             refreshCounts()
+            refreshWatchedFolders()
         }
 
         do {
             let result = try await coordinator.indexURLs(
                 urls,
-                videoWindowSampling: selectedSampling
+                videoWindowSampling: selectedSampling,
+                loadAudioFromVideo: loadAudioFromVideo
             ) { progress in
                 Task { @MainActor in
                     self.statusMessage = "Indexing (\(progress.processed)/\(progress.total)): \(progress.currentTitle)"
                 }
             }
             statusMessage = "Indexed \(result.indexed) artifacts (\(result.skipped.count) skipped)."
+        } catch is CancellationError {
+            statusMessage = "Indexing cancelled."
         } catch {
             statusMessage = "Index error: \(error.localizedDescription)"
         }
@@ -94,6 +183,7 @@ final class MbedViewModel {
                 exampleFileURL: queryAttachmentURL,
                 dimensions: selectedDimensions,
                 kinds: kinds,
+                taskOverride: selectedTaskOverride,
                 limit: 30
             )
             hits = results
@@ -175,16 +265,37 @@ struct SidebarView: View {
             }
 
             Section("MLX EmbeddingGemma 2") {
+                Picker("Engine", selection: $viewModel.selectedBackend) {
+                    ForEach(EngineBackend.allCases, id: \.self) { backend in
+                        Text(backend.label).tag(backend)
+                    }
+                }
+                .onChange(of: viewModel.selectedBackend) { _, _ in
+                    viewModel.setupCoordinator()
+                }
+
                 Picker("Matryoshka Dim", selection: $viewModel.selectedDimensions) {
                     ForEach(Matryoshka.gemma2Dimensions, id: \.self) { dim in
                         Text("\(dim)d").tag(dim)
                     }
+                }
+                Picker("Query Task", selection: $viewModel.selectedTaskOverride) {
+                    Text("Auto (Search / Code)").tag(Optional<EmbeddingTask>.none)
+                    Text("Search Result").tag(Optional<EmbeddingTask>.some(.query))
+                    Text("Code Retrieval").tag(Optional<EmbeddingTask>.some(.codeRetrieval))
+                    Text("Question Answering").tag(Optional<EmbeddingTask>.some(.questionAnswering))
+                    Text("Fact Verification").tag(Optional<EmbeddingTask>.some(.factVerification))
+                    Text("Sentence Similarity").tag(Optional<EmbeddingTask>.some(.sts))
+                    Text("Clustering").tag(Optional<EmbeddingTask>.some(.clustering))
+                    Text("Classification").tag(Optional<EmbeddingTask>.some(.classification))
                 }
                 Picker("Video Sampling", selection: $viewModel.selectedSampling) {
                     Text("Fixed FPS (32s)").tag(VideoWindowSampling.fps)
                     Text("Content (32s)").tag(VideoWindowSampling.content)
                     Text("Whole Video Only").tag(VideoWindowSampling.off)
                 }
+                Toggle("Include Video Soundtrack", isOn: $viewModel.loadAudioFromVideo)
+
                 HStack {
                     Text("Artifacts")
                     Spacer()
@@ -203,17 +314,58 @@ struct SidebarView: View {
                 Button("Add Files or Folders...") {
                     presentOpenPanel()
                 }
+                if !viewModel.watchedFolders.isEmpty {
+                    Button("Re-scan Watched Folders") {
+                        viewModel.reindexWatchedFolders()
+                    }
+                }
                 Button("Clear Index", role: .destructive) {
                     viewModel.clearIndex()
                 }
             }
 
-            Section("Server") {
-                TextField("heylook URL", text: $viewModel.serverURLString)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit {
-                        viewModel.setupCoordinator()
+            if !viewModel.watchedFolders.isEmpty {
+                Section("Watched Folders") {
+                    ForEach(viewModel.watchedFolders) { folder in
+                        HStack {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(folder.url.lastPathComponent)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                Text(folder.url.path)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Button {
+                                viewModel.removeWatchedFolder(folder)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
+                }
+            }
+
+            Section(viewModel.selectedBackend == .heylook ? "heylook Server" : "Local MLX Checkpoint") {
+                if viewModel.selectedBackend == .heylook {
+                    TextField("heylook URL", text: $viewModel.serverURLString)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            viewModel.setupCoordinator()
+                        }
+                } else {
+                    TextField("Checkpoint Path", text: $viewModel.checkpointPath)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            viewModel.setupCoordinator()
+                        }
+                }
             }
         }
         .overlay {
@@ -245,10 +397,7 @@ struct SidebarView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK {
-            let urls = panel.urls
-            Task {
-                await viewModel.indexURLs(urls)
-            }
+            viewModel.startIndexing(panel.urls)
         }
     }
 
@@ -258,7 +407,7 @@ struct SidebarView: View {
                 if let data = item as? Data,
                    let url = URL(dataRepresentation: data, relativeTo: nil) {
                     Task { @MainActor in
-                        await viewModel.indexURLs([url])
+                        viewModel.startIndexing([url])
                     }
                 }
             }
@@ -305,11 +454,17 @@ struct SearchAndResultsView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                HStack {
+                HStack(spacing: 8) {
                     Text(viewModel.statusMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
+                    if viewModel.isIndexing {
+                        Button("Stop", role: .destructive) {
+                            viewModel.cancelIndexing()
+                        }
+                        .controlSize(.small)
+                    }
                     if viewModel.isBusy {
                         ProgressView()
                             .controlSize(.small)
@@ -402,9 +557,20 @@ struct ThumbnailBadge: View {
         } else {
             ZStack {
                 Color.secondary.opacity(0.15)
-                Image(systemName: hit.artifact.kind == .code ? "chevron.left.forwardslash.chevron.right" : "doc.text")
+                Image(systemName: iconName)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var iconName: String {
+        switch hit.artifact.kind {
+        case .audio: return "waveform"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .document: return "doc.richtext"
+        case .image: return "photo"
+        case .video: return "film"
+        case .text: return "doc.text"
         }
     }
 }
@@ -415,6 +581,8 @@ struct InspectorView: View {
 
     var body: some View {
         if let hit = viewModel.selectedHit {
+            let activeSpan = hit.spanMatches[safe: viewModel.selectedSpanIndex]?.span ?? hit.bestSpan
+            let activeFrameTimes = activeSpan.frameTimes
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text(hit.artifact.title)
@@ -426,9 +594,9 @@ struct InspectorView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
 
-                    if hit.artifact.kind == .video {
+                    if hit.artifact.kind == .video || hit.artifact.kind == .audio {
                         MacVideoPlayerView(player: player)
-                            .frame(height: 240)
+                            .frame(height: hit.artifact.kind == .audio ? 64 : 240)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                             .onAppear {
                                 configurePlayer(for: hit, spanIndex: viewModel.selectedSpanIndex)
@@ -439,6 +607,32 @@ struct InspectorView: View {
                             .onChange(of: viewModel.selectedSpanIndex) { _, newIdx in
                                 configurePlayer(for: hit, spanIndex: newIdx)
                             }
+
+                        if !activeFrameTimes.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Sampled Frames (\(activeFrameTimes.count))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(activeFrameTimes, id: \.self) { frameTime in
+                                            Button {
+                                                seekPlayer(to: frameTime)
+                                            } label: {
+                                                Text(ArtifactSpan.formatTimestampMillis(frameTime))
+                                                    .font(.system(.caption2, design: .monospaced))
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 4)
+                                                    .background(Color.secondary.opacity(0.14))
+                                                    .clipShape(Capsule())
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else if hit.artifact.kind == .image,
                               let nsImage = NSImage(contentsOf: hit.artifact.url) {
                         Image(nsImage: nsImage)
@@ -446,7 +640,9 @@ struct InspectorView: View {
                             .scaledToFit()
                             .frame(maxHeight: 260)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
-                    } else if let snippet = hit.spanMatches[safe: viewModel.selectedSpanIndex]?.previewText ?? hit.previewText {
+                    }
+
+                    if let snippet = hit.spanMatches[safe: viewModel.selectedSpanIndex]?.previewText ?? hit.previewText {
                         ScrollView(.horizontal) {
                             Text(snippet)
                                 .font(.system(.caption, design: .monospaced))
@@ -508,6 +704,12 @@ struct InspectorView: View {
             avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
         }
         self.player = avPlayer
+    }
+
+    private func seekPlayer(to seconds: Double) {
+        guard let player else { return }
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 }
 

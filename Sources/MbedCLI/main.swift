@@ -14,19 +14,34 @@ struct MbedCLI {
         let dbURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MBED_DB"] ?? defaultDatabasePath())
 
         do {
+            let engine = makeEngine(args: args, serverURL: serverURL)
+
             switch subcommand {
             case "status":
                 let store = try VectorStore(databaseURL: dbURL)
                 let stats = try store.stats()
-                let engine = HeylookMLXEngine(baseURL: serverURL)
+                let watched = try store.listWatchedFolders()
                 print("Database:          \(dbURL.path)")
                 print("Indexed artifacts: \(stats.artifactCount)")
                 print("Embedded chunks:   \(stats.chunkCount)")
+                print("Watched folders:   \(watched.count)")
                 print("Model ID:          \(engine.modelID) (\(engine.nativeDimensions)d)")
+                print("Native MLX linked: \(NativeMLXEmbeddingGemma2.isAvailableInProcess ? "yes" : "no (build with MBED_ENABLE_NATIVE_MLX=1)")")
+
+            case "watched":
+                let store = try VectorStore(databaseURL: dbURL)
+                let watched = try store.listWatchedFolders()
+                if watched.isEmpty {
+                    print("No watched folders.")
+                } else {
+                    for folder in watched {
+                        print("\(folder.url.path) (sampling=\(folder.windowSampling.rawValue))")
+                    }
+                }
 
             case "index":
                 guard args.count >= 2 else {
-                    fputs("Usage: mbed-cli index <path> [--sampling fps|content|off]\n", stderr)
+                    fputs("Usage: mbed-cli index <path> [--sampling fps|content|off] [--audio-from-video] [--engine heylook|native] [--checkpoint <dir>]\n", stderr)
                     exit(1)
                 }
                 let targetURL = URL(fileURLWithPath: args[1])
@@ -35,13 +50,18 @@ struct MbedCLI {
                     let val = args[idx + 1]
                     sampling = val == "off" ? .off : (VideoWindowSampling(rawValue: val) ?? .fps)
                 }
+                let loadAudioFromVideo = args.contains("--audio-from-video")
                 let store = try VectorStore(databaseURL: dbURL)
-                let engine = HeylookMLXEngine(baseURL: serverURL)
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: targetURL.path, isDirectory: &isDir), isDir.boolValue {
+                    try? store.addWatchedFolder(targetURL, windowSampling: sampling)
+                }
                 let coordinator = IndexCoordinator(engine: engine, store: store)
 
                 let result = try await coordinator.indexURLs(
                     [targetURL],
-                    videoWindowSampling: sampling
+                    videoWindowSampling: sampling,
+                    loadAudioFromVideo: loadAudioFromVideo
                 ) { progress in
                     print("[\(progress.processed)/\(progress.total)] \(progress.currentTitle)")
                 }
@@ -49,7 +69,7 @@ struct MbedCLI {
 
             case "search":
                 guard args.count >= 2 else {
-                    fputs("Usage: mbed-cli search <query> [--dim 768|512|256|128]\n", stderr)
+                    fputs("Usage: mbed-cli search <query> [--dim 768|512|256|128] [--kind video|image|audio|text|code|document] [--task query|code|qa|fact|sts|clustering|classification] [--engine heylook|native]\n", stderr)
                     exit(1)
                 }
                 let query = args[1]
@@ -58,17 +78,31 @@ struct MbedCLI {
                    let parsed = Int(args[idx + 1]) {
                     dim = parsed
                 }
+                var kinds: Set<ArtifactKind>?
+                if let idx = args.firstIndex(of: "--kind"), idx + 1 < args.count,
+                   let kind = ArtifactKind(rawValue: args[idx + 1].lowercased()) {
+                    kinds = [kind]
+                }
+                var taskOverride: EmbeddingTask?
+                if let idx = args.firstIndex(of: "--task"), idx + 1 < args.count {
+                    taskOverride = parseTask(args[idx + 1])
+                }
                 let store = try VectorStore(databaseURL: dbURL)
-                let engine = HeylookMLXEngine(baseURL: serverURL)
                 let coordinator = IndexCoordinator(engine: engine, store: store)
-                let hits = try await coordinator.search(queryText: query, dimensions: dim, limit: 15)
+                let hits = try await coordinator.search(
+                    queryText: query,
+                    dimensions: dim,
+                    kinds: kinds,
+                    taskOverride: taskOverride,
+                    limit: 15
+                )
                 for (idx, hit) in hits.enumerated() {
                     let badge = hit.bestSpan.displayBadge ?? "Whole"
                     print(String(format: "%2d. [%.4f] %@ (%@) -> %@", idx + 1, hit.bestScore, hit.artifact.title, badge, hit.artifact.url.path))
                 }
 
             case "inspect-checkpoint":
-                let checkpointURL = args.count >= 2
+                let checkpointURL = args.count >= 2 && !args[1].hasPrefix("--")
                     ? URL(fileURLWithPath: args[1])
                     : NativeMLXEmbeddingGemma2.defaultCheckpointURL
                 let desc = try NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: checkpointURL)
@@ -87,6 +121,57 @@ struct MbedCLI {
         }
     }
 
+    private static func makeEngine(args: [String], serverURL: URL) -> any EmbeddingEngine {
+        var backend: EngineBackend = .heylook
+        if let idx = args.firstIndex(of: "--engine"), idx + 1 < args.count {
+            let val = args[idx + 1].lowercased()
+            if val == "native" || val == "native-mlx" || val == "mlx" {
+                backend = .nativeMLX
+            }
+        }
+        var checkpointURL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
+        if let idx = args.firstIndex(of: "--checkpoint"), idx + 1 < args.count {
+            checkpointURL = URL(fileURLWithPath: args[idx + 1])
+        }
+
+        switch backend {
+        case .heylook:
+            return HeylookMLXEngine(baseURL: serverURL)
+        case .nativeMLX:
+            #if canImport(MLXVLM)
+            return MLXSwiftLMEmbeddingGemma2Engine(checkpointURL: checkpointURL)
+            #else
+            fputs("Warning: Native MLX not linked (rebuild with MBED_ENABLE_NATIVE_MLX=1); falling back to heylook HTTP.\n", stderr)
+            return HeylookMLXEngine(baseURL: serverURL)
+            #endif
+        }
+    }
+
+    private static func parseTask(_ value: String) -> EmbeddingTask? {
+        switch value.lowercased() {
+        case "query", "search", "retrieval-query":
+            return .query
+        case "code", "coderetrieval", "instructionretrieval":
+            return .codeRetrieval
+        case "qa", "questionanswering":
+            return .questionAnswering
+        case "fact", "factchecking", "factverification":
+            return .factVerification
+        case "sts", "similarity":
+            return .sts
+        case "clustering", "cluster":
+            return .clustering
+        case "classification", "classify":
+            return .classification
+        case "document", "doc", "retrieval-document":
+            return .document
+        case "none", "off":
+            return EmbeddingTask.none
+        default:
+            return EmbeddingTask(rawValue: value)
+        }
+    }
+
     private static func defaultDatabasePath() -> String {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = appSupport.appendingPathComponent("mbed", isDirectory: true)
@@ -98,9 +183,10 @@ struct MbedCLI {
         print("""
         mbed-cli — Multimodal EmbeddingGemma 2 CLI
         Usage:
-          mbed-cli status
-          mbed-cli index <file-or-dir> [--sampling fps|content|off]
-          mbed-cli search <query> [--dim 768|512|256|128]
+          mbed-cli status [--engine heylook|native]
+          mbed-cli watched
+          mbed-cli index <file-or-dir> [--sampling fps|content|off] [--audio-from-video] [--engine heylook|native] [--checkpoint <dir>]
+          mbed-cli search <query> [--dim 768|512|256|128] [--kind video|image|audio|text|code|document] [--task query|code|qa|fact|sts|clustering|classification] [--engine heylook|native]
           mbed-cli inspect-checkpoint [checkpoint-dir]
         """)
     }

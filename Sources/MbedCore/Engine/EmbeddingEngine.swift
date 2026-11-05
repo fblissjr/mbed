@@ -7,6 +7,8 @@ public enum EmbeddingTask: String, Codable, CaseIterable, Sendable {
     case document
     case retrievalQuery = "Retrieval-query"
     case retrievalDocument = "Retrieval-document"
+    case questionAnswering = "QuestionAnswering"
+    case factVerification = "FactVerification"
     case sts = "STS"
     case clustering = "Clustering"
     case classification = "Classification"
@@ -21,8 +23,14 @@ public enum EmbeddingTask: String, Codable, CaseIterable, Sendable {
     /// used when running the tokenizer/model in-process.
     public var prefixText: String {
         switch self {
-        case .query, .retrievalQuery, .codeRetrieval:
+        case .query, .retrievalQuery:
             return "task: search result | query: "
+        case .questionAnswering:
+            return "task: question answering | query: "
+        case .factVerification:
+            return "task: fact checking | query: "
+        case .codeRetrieval:
+            return "task: code retrieval | query: "
         case .document, .retrievalDocument:
             return "title: none | text: "
         case .clustering:
@@ -33,6 +41,29 @@ public enum EmbeddingTask: String, Codable, CaseIterable, Sendable {
             return "task: sentence similarity | query: "
         case .none:
             return ""
+        }
+    }
+
+    public static func documentPrompt(title: String?, text: String) -> String {
+        let cleanTitle = title?
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        if let cleanTitle, !cleanTitle.isEmpty {
+            return "title: \(cleanTitle) | text: \(text)"
+        }
+        return "title: none | text: \(text)"
+    }
+}
+
+/// Engine backend selection for `MbedApp` and `mbed-cli`.
+public enum EngineBackend: String, Codable, CaseIterable, Sendable {
+    case heylook
+    case nativeMLX = "native"
+
+    public var label: String {
+        switch self {
+        case .heylook: return "heylookllm Server (HTTP)"
+        case .nativeMLX: return "In-Process MLX Swift"
         }
     }
 }
@@ -53,23 +84,86 @@ public enum VideoWindowSampling: String, Codable, CaseIterable, Sendable {
 }
 
 /// One ordered block inside a multimodal `EmbeddingInput`.
+/// Supports either in-memory `Data` or a direct file `URL` (so in-process MLX reads directly
+/// from disk without copying 200 MB videos through `/tmp`, and `HeylookMLXEngine` only reads
+/// `Data` per sub-batch).
 public enum EmbeddingPart: Sendable, Equatable {
     case text(String)
-    case media(kind: ArtifactKind, mimeType: String, data: Data, windowSampling: VideoWindowSampling = .off)
+    case media(
+        kind: ArtifactKind,
+        mimeType: String,
+        data: Data? = nil,
+        url: URL? = nil,
+        windowSampling: VideoWindowSampling = .off
+    )
+
+    public static func mediaURL(
+        kind: ArtifactKind,
+        mimeType: String? = nil,
+        url: URL,
+        windowSampling: VideoWindowSampling = .off
+    ) -> EmbeddingPart {
+        .media(
+            kind: kind,
+            mimeType: mimeType ?? ArtifactKind.mimeType(for: url),
+            data: nil,
+            url: url,
+            windowSampling: windowSampling
+        )
+    }
+
+    public func resolvedData() throws -> Data {
+        switch self {
+        case .text(let s):
+            return Data(s.utf8)
+        case let .media(_, _, data, url, _):
+            if let data { return data }
+            if let url { return try Data(contentsOf: url) }
+            return Data()
+        }
+    }
+
+    public var estimatedBytes: Int {
+        switch self {
+        case .text(let s):
+            return s.utf8.count
+        case let .media(_, _, data, url, _):
+            if let data { return data.count }
+            if let url,
+               let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue {
+                return size
+            }
+            return 0
+        }
+    }
 }
 
 /// One item submitted for embedding. Produces one primary vector (and optional window vectors).
 public struct EmbeddingInput: Sendable, Equatable {
     public let parts: [EmbeddingPart]
     public let task: EmbeddingTask
+    public let title: String?
 
-    public init(parts: [EmbeddingPart], task: EmbeddingTask = .document) {
+    public init(parts: [EmbeddingPart], task: EmbeddingTask = .document, title: String? = nil) {
         self.parts = parts
         self.task = task
+        self.title = title
     }
 
-    public static func text(_ value: String, task: EmbeddingTask) -> EmbeddingInput {
-        EmbeddingInput(parts: [.text(value)], task: task)
+    public static func text(_ value: String, task: EmbeddingTask, title: String? = nil) -> EmbeddingInput {
+        EmbeddingInput(parts: [.text(value)], task: task, title: title)
+    }
+
+    /// True if at least one part is `.text` with non-whitespace characters.
+    /// Pure-media inputs (no text) encode bare `<bos><|media|><eos>` without a task instruction prefix
+    /// in upstream `EmbeddingGemma 2` (`processing_embedding_gemma2.py` and `mlx-swift-lm`).
+    public var hasNonWhitespaceText: Bool {
+        parts.contains { part in
+            if case .text(let s) = part {
+                return !s.allSatisfy(\.isWhitespace)
+            }
+            return false
+        }
     }
 }
 

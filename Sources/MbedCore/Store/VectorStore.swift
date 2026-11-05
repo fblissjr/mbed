@@ -53,6 +53,8 @@ public final class VectorStore: @unchecked Sendable {
             title TEXT NOT NULL,
             byte_count INTEGER NOT NULL,
             modified_ms INTEGER NOT NULL,
+            window_sampling TEXT NOT NULL DEFAULT '',
+            model_id TEXT NOT NULL DEFAULT '',
             attributes_json TEXT NOT NULL
         );
 
@@ -65,20 +67,38 @@ public final class VectorStore: @unchecked Sendable {
             preview_text TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS watched_folders (
+            path TEXT PRIMARY KEY,
+            collection_id TEXT NOT NULL,
+            window_sampling TEXT NOT NULL DEFAULT 'fps',
+            added_ms INTEGER NOT NULL,
+            last_indexed_ms INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_chunks_artifact ON chunks(artifact_id);
         CREATE INDEX IF NOT EXISTS idx_artifacts_collection ON artifacts(collection_id);
         """)
+        // Idempotent schema migrations for pre-existing mbed.sqlite3 stores.
+        _ = try? execute("ALTER TABLE artifacts ADD COLUMN window_sampling TEXT NOT NULL DEFAULT '';")
+        _ = try? execute("ALTER TABLE artifacts ADD COLUMN model_id TEXT NOT NULL DEFAULT '';")
+        _ = try? execute("ALTER TABLE watched_folders ADD COLUMN window_sampling TEXT NOT NULL DEFAULT 'fps';")
     }
 
     deinit {
         if let db { sqlite3_close(db) }
     }
 
-    /// Returns whether an artifact with the exact same `id` and `fingerprint` is already indexed.
-    public func isUpToDate(artifactID: String, fingerprint: ContentFingerprint) throws -> Bool {
+    /// Returns whether an artifact with the exact same `id`, `fingerprint`, `windowSampling`,
+    /// and `modelID` is already indexed.
+    public func isUpToDate(
+        artifactID: String,
+        fingerprint: ContentFingerprint,
+        windowSampling: VideoWindowSampling = .off,
+        modelID: String = ""
+    ) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        let sql = "SELECT byte_count, modified_ms FROM artifacts WHERE id = ? LIMIT 1;"
+        let sql = "SELECT byte_count, modified_ms, window_sampling, model_id FROM artifacts WHERE id = ? LIMIT 1;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw lastError()
@@ -88,13 +108,24 @@ public final class VectorStore: @unchecked Sendable {
         if sqlite3_step(stmt) == SQLITE_ROW {
             let bytes = sqlite3_column_int64(stmt, 0)
             let mtime = sqlite3_column_int64(stmt, 1)
-            return bytes == fingerprint.byteCount && mtime == fingerprint.modifiedUnixMs
+            let storedSampling = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+            let storedModel = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            let modelMatches = modelID.isEmpty || storedModel.isEmpty || storedModel == modelID
+            return bytes == fingerprint.byteCount
+                && mtime == fingerprint.modifiedUnixMs
+                && storedSampling == windowSampling.rawValue
+                && modelMatches
         }
         return false
     }
 
     /// Atomically upserts an `Artifact` and replaces its `EmbeddedChunk` rows.
-    public func upsert(artifact: Artifact, chunks: [EmbeddedChunk]) throws {
+    public func upsert(
+        artifact: Artifact,
+        chunks: [EmbeddedChunk],
+        windowSampling: VideoWindowSampling = .off,
+        modelID: String = ""
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
         try execute("BEGIN IMMEDIATE TRANSACTION;")
@@ -104,8 +135,10 @@ public final class VectorStore: @unchecked Sendable {
             let attrString = String(data: attrData, encoding: .utf8) ?? "{}"
 
             let insertArtifact = """
-            INSERT INTO artifacts (id, collection_id, kind, url, title, byte_count, modified_ms, attributes_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO artifacts (
+                id, collection_id, kind, url, title, byte_count, modified_ms, window_sampling, model_id, attributes_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var aStmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, insertArtifact, -1, &aStmt, nil) == SQLITE_OK else {
@@ -119,7 +152,9 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_text(aStmt, 5, artifact.title, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(aStmt, 6, artifact.fingerprint.byteCount)
             sqlite3_bind_int64(aStmt, 7, artifact.fingerprint.modifiedUnixMs)
-            sqlite3_bind_text(aStmt, 8, attrString, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(aStmt, 8, windowSampling.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(aStmt, 9, modelID, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(aStmt, 10, attrString, -1, SQLITE_TRANSIENT)
             guard sqlite3_step(aStmt) == SQLITE_DONE else { throw lastError() }
 
             let insertChunk = """
@@ -323,6 +358,148 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         return StoreStats(artifactCount: totalArtifacts, chunkCount: totalChunks, countsByKind: byKind)
+    }
+
+    public struct WatchedFolder: Sendable, Equatable, Identifiable, Hashable {
+        public var id: String { path }
+        public let path: String
+        public let collectionID: String
+        public let windowSampling: VideoWindowSampling
+        public let addedUnixMs: Int64
+        public let lastIndexedUnixMs: Int64
+
+        public var url: URL { URL(fileURLWithPath: path) }
+        public var title: String { url.lastPathComponent }
+
+        public init(
+            path: String,
+            collectionID: String,
+            windowSampling: VideoWindowSampling = .fps,
+            addedUnixMs: Int64,
+            lastIndexedUnixMs: Int64
+        ) {
+            self.path = path
+            self.collectionID = collectionID
+            self.windowSampling = windowSampling
+            self.addedUnixMs = addedUnixMs
+            self.lastIndexedUnixMs = lastIndexedUnixMs
+        }
+    }
+
+    public func addWatchedFolder(
+        _ url: URL,
+        collectionID: String = "default",
+        windowSampling: VideoWindowSampling = .fps
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let standardized = url.standardizedFileURL.path
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let sql = """
+        INSERT INTO watched_folders (path, collection_id, window_sampling, added_ms, last_indexed_ms)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            window_sampling = excluded.window_sampling,
+            last_indexed_ms = excluded.last_indexed_ms;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw lastError() }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, standardized, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, collectionID, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, windowSampling.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 4, nowMs)
+        sqlite3_bind_int64(stmt, 5, nowMs)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw lastError() }
+    }
+
+    public func removeWatchedFolder(_ url: URL) throws {
+        try removeWatchedFolder(path: url.standardizedFileURL.path)
+    }
+
+    public func removeWatchedFolder(path: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let sql = "DELETE FROM watched_folders WHERE path = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw lastError() }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw lastError() }
+    }
+
+    public func listWatchedFolders() throws -> [WatchedFolder] {
+        lock.lock()
+        defer { lock.unlock() }
+        let sql = "SELECT path, collection_id, window_sampling, added_ms, last_indexed_ms FROM watched_folders ORDER BY added_ms ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw lastError() }
+        defer { sqlite3_finalize(stmt) }
+        var out = [WatchedFolder]()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let p = String(cString: sqlite3_column_text(stmt, 0))
+            let c = String(cString: sqlite3_column_text(stmt, 1))
+            let sRaw = sqlite3_column_type(stmt, 2) == SQLITE_NULL
+                ? "fps"
+                : String(cString: sqlite3_column_text(stmt, 2))
+            let s = VideoWindowSampling(rawValue: sRaw) ?? .fps
+            let added = sqlite3_column_int64(stmt, 3)
+            let lastIdx = sqlite3_column_int64(stmt, 4)
+            out.append(WatchedFolder(
+                path: p,
+                collectionID: c,
+                windowSampling: s,
+                addedUnixMs: added,
+                lastIndexedUnixMs: lastIdx
+            ))
+        }
+        return out
+    }
+
+    /// Removes any indexed artifacts (and their chunks) under `rootDirectory` in `collectionID`
+    /// whose underlying file no longer exists on disk. Returns the number of pruned artifacts.
+    @discardableResult
+    public func pruneMissingArtifacts(
+        under rootDirectory: URL,
+        collectionID: String = "default"
+    ) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let rawRoot = rootDirectory.standardizedFileURL.path
+        let resolvedRoot = rootDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+        let prefixes = Set([
+            rawRoot.hasSuffix("/") ? rawRoot : rawRoot + "/",
+            resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/",
+        ])
+        let sql = "SELECT id, url FROM artifacts WHERE collection_id = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw lastError() }
+        var staleIDs = [String]()
+        sqlite3_bind_text(stmt, 1, collectionID, -1, SQLITE_TRANSIENT)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let urlStr = String(cString: sqlite3_column_text(stmt, 1))
+            let fileURL = URL(string: urlStr) ?? URL(fileURLWithPath: urlStr)
+            let filePath = fileURL.standardizedFileURL.path
+            let matchesRoot = prefixes.contains { filePath.hasPrefix($0) }
+            if matchesRoot && !FileManager.default.fileExists(atPath: filePath) {
+                staleIDs.append(id)
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        guard !staleIDs.isEmpty else { return 0 }
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            for id in staleIDs {
+                try deleteChunksAndArtifactUnlocked(artifactID: id)
+            }
+            try execute("COMMIT;")
+            return staleIDs.count
+        } catch {
+            _ = try? execute("ROLLBACK;")
+            throw error
+        }
     }
 
     public func clearAll() throws {

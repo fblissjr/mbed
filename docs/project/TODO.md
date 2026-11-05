@@ -1,74 +1,62 @@
-# Backlog & Incomplete Items (`heylook` -> `mbed`)
+# Backlog & Completed Items (`heylook` -> `mbed`)
 
-This document tracks everything that was left incomplete, half-baked, or stubbed during the initial extraction of Media Finder from `heylookitsanllm` into `mbed`.
+This document tracks the 5-track backlog from the extraction of Media Finder from `heylookitsanllm` into `mbed`.
 
 ---
 
 ## Track 1: In-Process `mlx-swift-lm` Engine (`NativeMLXEmbeddingGemma2`)
 
-- [ ] **1.1 Link `mlx-swift` and `mlx-swift-lm` in `Package.swift`**
-  - Add local package dependencies on `/Users/fredbliss/mlx/mlx-swift` and `/Users/fredbliss/mlx/mlx-swift-lm` (`MLXVLM`, `MLXLMCommon`, `MLXHuggingFace`) so `#if canImport(MLXVLM) && canImport(MLXLMCommon)` in [`NativeMLXEmbeddingGemma2.swift`](../../Sources/MbedCore/Engine/NativeMLXEmbeddingGemma2.swift) is active in `MbedCore`, `MbedApp`, and `MbedCLI`.
-  - Build and run with `xcodebuild` (or SwiftPM + Metal shader bundle) so `MLXVLM`'s custom `embedding_gemma2_resize_axis` Metal bicubic resize kernel compiles into the binary.
-- [ ] **1.2 Wire windowed video frame extraction into `MLXSwiftLMEmbeddingGemma2Engine`**
-  - Currently [`MLXSwiftLMEmbeddingGemma2Engine.embedBatch`](../../Sources/MbedCore/Engine/NativeMLXEmbeddingGemma2.swift#L180-L221) embeds only the whole video (`vlmParts.append(.video(.url(tempURL)))`) and returns `EmbeddedOutput(vector: primary, windows: [])`.
-  - When `windowSampling != .off` (`fps` or `content`):
-    1. Decode frames using `AVAssetImageGenerator` (`appliesPreferredTrackTransform = true`).
-    2. Run `WindowPlanner.planWindows` (`fps` at 1 fps, or `content` over 4 fps `32x32` luma thumbnails with duration-scaled budget `min(32, max(2, ceil((hi - lo) * 1.0)))`).
-    3. For each planned window (when `windows.count > 1`), pass `UserInput.Video.frames([UserInput.VideoFrame])` into `MLXVLM.EmbeddingGemma2Embedding` and populate `EmbeddedOutput.windows`.
-- [ ] **1.3 Pass file `URL`s directly in `EmbeddingPart` instead of round-tripping `Data` through `/tmp`**
-  - `EmbeddingPart.media` currently holds raw `Data`. For a 200 MB video, `IndexCoordinator` reads the entire file into `Data`, and `MLXSwiftLMEmbeddingGemma2Engine` writes that `Data` back out to a temporary file (`tempURL`) just to hand a `URL` to `MLXVLM`.
-  - Add `.mediaURL(kind: ArtifactKind, mimeType: String, url: URL, windowSampling: VideoWindowSampling)` (or carry `url: URL?` on `.media`) so in-process MLX reads the file directly from disk with zero copies, and only `HeylookMLXEngine` reads/base64-encodes `Data` when talking over HTTP.
+- [x] **1.1 Link `mlx-swift` and `mlx-swift-lm` in `Package.swift`** *(Gated on `MBED_ENABLE_NATIVE_MLX=1`; requires `mlx-swift` C++ submodules initialized)*
+  - Added conditional local package dependencies on `../../mlx/mlx-swift` and `../../mlx/mlx-swift-lm` (`MLXVLM`, `MLXLMCommon`, `MLXHuggingFace`) gated behind `MBED_ENABLE_NATIVE_MLX=1` in [`Package.swift`](../../Package.swift) so default `swift build` / `swift test` stay fast and offline while [`scripts/build_native_mlx.sh`](../../scripts/build_native_mlx.sh) verifies `/Users/fredbliss/mlx/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt` and builds the full Metal shader bundle (`default.metallib` + `embedding_gemma2_resize_axis`) via `xcodebuild`.
+  - *Remaining host step*: Run `git -C /Users/fredbliss/mlx/mlx-swift submodule update --init --recursive` and `./scripts/build_native_mlx.sh` to compile and smoke-test the `#if canImport(MLXVLM)` block against `/Users/fredbliss/Storage/llms/google/embeddinggemma-2-MLX-BF16`.
+- [x] **1.2 Wire windowed video frame extraction into `MLXSwiftLMEmbeddingGemma2Engine`**
+  - Updated [`MLXSwiftLMEmbeddingGemma2Engine.embedBatch`](../../Sources/MbedCore/Engine/NativeMLXEmbeddingGemma2.swift) to run `ArtifactProcessor.extractVideoCandidates`, `WindowPlanner.planWindows`, and `ArtifactProcessor.decodeVideoFrames` when `windowSampling != .off`, passing `UserInput.Video.frames([UserInput.VideoFrame])` (and optional aligned soundtrack WAV slices when `loadAudioFromVideo` is enabled) into `MLXVLM.EmbeddingGemma2Embedding` and populating `EmbeddedOutput.windows`.
+- [x] **1.3 Pass file `URL`s directly in `EmbeddingPart` instead of round-tripping `Data` through `/tmp`**
+  - Added `url: URL?` and `EmbeddingPart.mediaURL(...)` to [`EmbeddingEngine.swift`](../../Sources/MbedCore/Engine/EmbeddingEngine.swift) so in-process MLX reads directly from disk with zero copies and `HeylookMLXEngine` resolves `Data` lazily per sub-batch.
 
 ---
 
 ## Track 2: `HeylookMLXEngine` & Client-Side Batching Parity
 
-- [ ] **2.1 Batch `embedBatch` calls to respect `heylook`'s `16`-item & `256 MiB` request limits**
-  - In `heylookitsanllm`, `/v1/embeddings` enforces `limits.items = 16` and `limits.request_media_bytes = 256 MiB` (which `frontend/js/embed-kit.js` handled via `planBatches`).
-  - In `mbed`, [`IndexCoordinator.buildChunks`](../../Sources/MbedCore/IndexCoordinator.swift#L180-L197) sends all line chunks of a text/code document in a single `engine.embedBatch(inputs)` call. Any file with `> 16` chunks (`> ~810` lines) will fail with HTTP 422 against `heylookllm`.
-  - Add batch chunking (`maxItems = 16`, `maxBytes = 192 MiB`) inside `HeylookMLXEngine.embedBatch`.
-- [ ] **2.2 Query `GET /v1/models` on connect in `HeylookMLXEngine`**
-  - Read `engine.embedding.limits`, `engine.embedding.video_windows`, and `engine.embedding.prompts` from `heylookllm`'s `/v1/models` endpoint instead of assuming static defaults.
+- [x] **2.1 Batch `embedBatch` calls to respect `heylook`'s `16`-item & `256 MiB` request limits**
+  - Implemented `HeylookMLXEngine.planBatches(_:maxItems:maxRequestMediaBytes:)` (`16` items, `0.75 * 256 MiB = 192 MiB` raw media bytes) in [`HeylookMLXEngine.swift`](../../Sources/MbedCore/Engine/HeylookMLXEngine.swift) and updated `embedBatch` to execute sub-batches sequentially with cooperative cancellation (`testHeylookPlanBatches`).
+- [x] **2.2 Query `GET /v1/models` on connect in `HeylookMLXEngine`**
+  - Added `HeylookServerCapabilities` and `fetchCapabilities()` (`GET /v1/models`) to [`HeylookMLXEngine.swift`](../../Sources/MbedCore/Engine/HeylookMLXEngine.swift), and wired `embedBatch` to automatically probe `fetchCapabilities()` once on first use so server-advertised `limits.items` and `limits.request_media_bytes` take effect automatically (`testHeylookMLXEngineHTTPWireAndCapabilities`).
 
 ---
 
 ## Track 3: Video Windowing, Audio Windowing & Soundtrack Extraction
 
-- [ ] **3.1 Overlapping video window stride (`16s` stride on `32s` windows)**
-  - [`WindowPlanner.planWindows`](../../Sources/MbedCore/Pipeline/ArtifactProcessor.swift#L127-L162) currently advances `lo += windowSeconds` (`32s` non-overlapping steps: `0–32s`, `32–64s`).
-  - Add `strideSeconds: Double = 16.0` (matching the 32s window / 16s stride design) so an action that crosses the 32.0s boundary is captured cleanly inside an overlapping `[16s–48s]` window.
-- [ ] **3.2 Live `AVFoundation` 4 fps candidate extractor for `"content"` mode**
-  - Implement `ArtifactProcessor.extractCandidateThumbnails(for videoURL: URL, candidateFPS: Double = 4.0) async throws -> (times: [Double], thumbnails: [[Float]], frames: [CIImage])` using `AVAssetReader` or `AVAssetImageGenerator` (`appliesPreferredTrackTransform = true`, downsampled to `32x32` luma) so `WindowPlanner.pickContent` can run natively in Swift.
-- [ ] **3.3 Audio windowing (`30s` windows) and video soundtrack indexing**
-  - `EmbeddingGemma 2`'s `Gemma4AudioModel` encodes up to 30 seconds of audio per forward, and video blocks only embed visual frames (ignoring the audio track).
-  - Slice `.audio` files longer than 30s into `ArtifactSpan.temporal(start:end:frameTimes:)` chunks, and optionally extract + embed the audio track of `.video` files so speech/music queries match video segments too.
+- [x] **3.1 Overlapping video window stride (`16s` stride on `32s` windows)**
+  - Added `strideSeconds: Double? = nil` (defaulting to `windowSeconds / 2.0 = 16.0s`) to `WindowPlanner.planWindows` in [`ArtifactProcessor.swift`](../../Sources/MbedCore/Pipeline/ArtifactProcessor.swift) (`testWindowPlannerLongVideo`).
+  - *Note on Option A (`HeylookMLXEngine`)*: When `HeylookMLXEngine` sends a whole video with `video_window_sampling: "fps" | "content"`, windowing happens server-side in `heylookllm` (`src/heylook_llm/providers/video_windows.py`), which currently uses non-overlapping `32s` stride (`lo += seconds`). Local `WindowPlanner.planWindows` (used by Option B and `MbedCore`) uses `16s` overlapping stride.
+- [x] **3.2 Live `AVFoundation` candidate extractor for `"content"` mode & per-window thumbnails**
+  - Implemented `ArtifactProcessor.extractVideoCandidates` (`32x32` RGB thumbnails at exact frame-center timestamps `(idx + 0.5) / nativeFPS`, with a metadata-only fast path for `.fps`), `ArtifactProcessor.decodeVideoFrames` (`appliesPreferredTrackTransform = true`), and `ArtifactProcessor.makeThumbnailJPEG(..., atSeconds:)` in [`ArtifactProcessor.swift`](../../Sources/MbedCore/Pipeline/ArtifactProcessor.swift) (`testLiveAVFoundationVideoCandidatesAndFrameDecoding`).
+- [x] **3.3 Audio windowing (`30s` windows) and video soundtrack indexing**
+  - Implemented `ArtifactProcessor.decodeMonoPCM`, `ArtifactProcessor.encodeWAV16Mono`, `ArtifactProcessor.encodeAudioSliceWAV`, and `ArtifactProcessor.extractAudioWindows` (`30s` windows with `15s` stride at `16 kHz`) in [`ArtifactProcessor.swift`](../../Sources/MbedCore/Pipeline/ArtifactProcessor.swift), plus opt-in `loadAudioFromVideo` parity in [`IndexCoordinator.swift`](../../Sources/MbedCore/IndexCoordinator.swift) matching upstream `EmbeddingGemma 2` (`<|video|> <|audio|>` separated by `.text(" ")` + aligned `[w.start, w.end]` soundtrack windows) (`testAudioWindowsAndVideoSoundtrackParity`).
 
 ---
 
 ## Track 4: `VectorStore` Configuration Tracking & Extensible Modalities (`.document` / `.code`)
 
-- [ ] **4.1 Include `video_window_sampling` (and `model_id`) in `VectorStore.isUpToDate`**
-  - Currently [`VectorStore.isUpToDate`](../../Sources/MbedCore/Store/VectorStore.swift#L78-L94) only compares `byte_count` and `modified_ms`.
-  - If a user indexes a video folder under `Whole Video Only` (`.off`) and then switches to `Fixed FPS (32s)` (`.fps`) or `Content (32s)` (`.content`), re-indexing skips the already-indexed videos instead of generating their window chunks.
-  - Store `window_sampling TEXT` on `artifacts` (for `.video` rows) and require it to match in `isUpToDate`.
-- [ ] **4.2 PDF & Rich Document Extraction (`PDFKit` -> `ArtifactSpan.pages`)**
-  - `ArtifactKind.detect` classifies `.pdf` and `.rtf` as `.document`, and `ArtifactSpan.pages(startPage:endPage:)` is defined, but [`IndexCoordinator.buildChunks`](../../Sources/MbedCore/IndexCoordinator.swift#L180-L197) currently calls `String(contentsOf: artifact.url, encoding: .utf8)` for all non-media files, which fails on binary PDFs.
-  - Use macOS `PDFKit` (`PDFDocument(url:)`) in `ArtifactProcessor` to extract per-page text (and/or rendered page thumbnails for scanned PDFs) and emit `.pages(startPage: p, endPage: p)` chunks.
-- [ ] **4.3 Use `.codeRetrieval` task prompt for `.code` artifacts**
-  - `EmbeddingGemma 2` includes a dedicated `CodeRetrieval` prompt in `config_sentence_transformers.json`. Wire `.code` artifacts to use `.codeRetrieval` when appropriate or expose task-prompt selection.
+- [x] **4.1 Include `video_window_sampling` (and `model_id`) in `VectorStore.isUpToDate`**
+  - Added `window_sampling` and `model_id` columns (with idempotent `ALTER TABLE` migrations) to `artifacts` in [`VectorStore.swift`](../../Sources/MbedCore/Store/VectorStore.swift) and required them to match in `isUpToDate` (`testVectorStoreConfigInvalidation`).
+- [x] **4.2 PDF & Rich Document Extraction (`PDFKit` -> `ArtifactSpan.pages`)**
+  - Implemented `ArtifactProcessor.chunkDocument(at:)` using macOS `PDFKit` (`PDFDocument`) and `NSAttributedString`, emitting `.pages(startPage:endPage:)` spans and rendered page thumbnails (`testPDFChunkingAndCodeRetrievalRouting`).
+- [x] **4.3 Use `.codeRetrieval` task prompt for `.code` artifacts & expose query task overrides**
+  - Fixed `EmbeddingTask.codeRetrieval.prefixText` to `"task: code retrieval | query: "` (and added `.questionAnswering` and `.factVerification`) in [`EmbeddingEngine.swift`](../../Sources/MbedCore/Engine/EmbeddingEngine.swift), forwarded `title: artifact.title` (`title: <filename> | text: ...`), routed `.code`-filtered searches to `.codeRetrieval`, and added `taskOverride: EmbeddingTask?` to `IndexCoordinator.search`, `MbedApp`, and `mbed-cli search --task` (`testPDFChunkingAndCodeRetrievalRouting`, `testPruneMissingArtifactsAndTaskOverride`).
 
 ---
 
 ## Track 5: Native macOS App (`MbedApp`) UX Completeness
 
-- [ ] **5.1 Indexing cancellation (`Stop` button)**
-  - Store the active indexing `Task<Void, Never>?` on `MbedViewModel` and render a **Stop** button next to the progress indicator in [`MbedApp.swift`](../../Sources/MbedApp/MbedApp.swift) that calls `indexTask?.cancel()`, triggering `HeylookMLXEngine.cancelRemoteRequest` (`DELETE /v1/requests/{id}`) or cooperative in-process cancellation.
-- [ ] **5.2 Sampled `frameTimes` jump buttons in `InspectorView`**
-  - `ArtifactSpan.temporal` already stores `frameTimes: [Double]`, and `heylook` `#/embeddings` Compare now shows clickable frame-timestamp jump buttons inside its video window preview dialog.
-  - Render clickable timestamp pills for `match.span.frameTimes` beneath `MacVideoPlayerView` in [`InspectorView`](../../Sources/MbedApp/MbedApp.swift#L429-L486) so clicking any sampled frame seeks `AVPlayer` directly to that frame.
-- [ ] **5.3 Audio player in `InspectorView`**
-  - Add an inline `AVPlayerView` (or audio scrubber) when `hit.artifact.kind == .audio` so `.audio` search hits can be played back directly in the inspector.
-- [ ] **5.4 Engine switcher (In-Process `mlx-swift-lm` vs `heylookllm` HTTP)**
-  - Add a sidebar picker in `MbedApp` and a `--engine native|heylook` flag in `mbed-cli` once Track 1.1 is linked.
-- [ ] **5.5 Persisted watch folders & `FSEvents` auto-indexing**
-  - Persist added root folder paths in a `collections` table in `mbed.sqlite3`, show them in the sidebar with per-folder refresh/remove actions, and optionally watch them with `FSEventStream` for automatic background re-indexing.
+- [x] **5.1 Indexing cancellation (`Stop` button)**
+  - Stored `indexTask: Task<Void, Never>?` on `MbedViewModel` and added a destructive **Stop** button in [`MbedApp.swift`](../../Sources/MbedApp/MbedApp.swift).
+- [x] **5.2 Sampled `frameTimes` jump buttons in `InspectorView`**
+  - Rendered clickable millisecond timestamp pills (`ArtifactSpan.formatTimestampMillis`) beneath `MacVideoPlayerView` in [`MbedApp.swift`](../../Sources/MbedApp/MbedApp.swift) that seek `AVPlayer` directly to the sampled frame.
+- [x] **5.3 Audio player in `InspectorView`**
+  - Enabled `MacVideoPlayerView` (`AVPlayerView`) for `.audio` hits in [`MbedApp.swift`](../../Sources/MbedApp/MbedApp.swift) with automatic seeking to `startTimeSeconds`.
+- [x] **5.4 Engine switcher (In-Process `mlx-swift-lm` vs `heylookllm` HTTP)**
+  - Added an Engine picker, Query Task picker, and `Include Video Soundtrack` toggle in [`MbedApp.swift`](../../Sources/MbedApp/MbedApp.swift) and `--engine heylook|native`, `--checkpoint <dir>`, `--audio-from-video`, and `--task <task>` flags in [`main.swift`](../../Sources/MbedCLI/main.swift).
+- [x] **5.5 Persisted watch folders, `FSEvents` auto-indexing & deleted-file pruning**
+  - Added `watched_folders` table and `pruneMissingArtifacts(under:collectionID:)` in [`VectorStore.swift`](../../Sources/MbedCore/Store/VectorStore.swift), created [`FolderWatcher.swift`](../../Sources/MbedCore/Pipeline/FolderWatcher.swift) (`FSEventStream`), and wired watched folder management into `MbedApp` and `mbed-cli watched` (`testWatchedFoldersPersistence`, `testPruneMissingArtifactsAndTaskOverride`).

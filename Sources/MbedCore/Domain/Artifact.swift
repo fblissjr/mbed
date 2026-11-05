@@ -103,9 +103,26 @@ public enum ArtifactSpan: Codable, Hashable, Sendable {
         return nil
     }
 
-    private static func formatSeconds(_ s: Double) -> String {
+    public var endTimeSeconds: Double? {
+        if case let .temporal(_, end, _) = self { return end }
+        return nil
+    }
+
+    public var frameTimes: [Double] {
+        if case let .temporal(_, _, times) = self { return times }
+        return []
+    }
+
+    public static func formatSeconds(_ s: Double) -> String {
         let total = max(0, Int(s.rounded(.down)))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    public static func formatTimestampMillis(_ s: Double) -> String {
+        let clamped = max(0, s)
+        let mins = Int(clamped) / 60
+        let secs = clamped - Double(mins * 60)
+        return String(format: "%d:%04.1f", mins, secs)
     }
 }
 
