@@ -34,3 +34,8 @@ swift run mbed-cli search "person walking across street" --dim 256
 # Launch the native SwiftUI macOS desktop app
 swift run mbed-app
 ```
+
+## Project Status & Backlog
+
+- [docs/project/CURRENT.md](./docs/project/CURRENT.md): Subsystem grading (`SOLID` vs `HALF-BAKED`).
+- [docs/project/TODO.md](./docs/project/TODO.md): Remaining tasks from the `heylook` -> `mbed` extraction.

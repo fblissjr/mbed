@@ -2,6 +2,11 @@
 
 Operating guide for `mbed` — a native macOS Swift package and desktop application for indexing and searching multimodal artifacts (video, images, audio, text, code, and documents) using **MLX `EmbeddingGemma 2`** (`embeddinggemma-2-MLX-BF16`).
 
+## Where to Look First
+
+- [docs/project/CURRENT.md](./docs/project/CURRENT.md): Graded status (`SOLID` vs `HALF-BAKED`) of every subsystem.
+- [docs/project/TODO.md](./docs/project/TODO.md): Prioritized backlog and incomplete items from the `heylook` -> `mbed` migration.
+
 ## Design Principles
 
 1. **Extensible Artifact & Span Model (`Sources/MbedCore/Domain/Artifact.swift`)**:
