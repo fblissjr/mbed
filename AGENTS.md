@@ -33,7 +33,7 @@ Operating guide for `mbed` — a native macOS Swift 6 package and desktop applic
 
 | Path | Role |
 | :--- | :--- |
-| `Package.swift` | Swift 6.0 package manifest (`macOS(.v14)`): `MbedCore` library, `MbedApp` SwiftUI macOS executable, `MbedCLI` CLI executable, and `MbedCoreTests` (automatically linking `mlx-swift` and `mlx-swift-lm` when `../../mlx/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt` exists, unless `MBED_DISABLE_NATIVE_MLX=1`). |
+| `Package.swift` | Swift 6.0 package manifest (`macOS(.v15)`): `MbedCore` library, `MbedApp` SwiftUI macOS desktop executable, `MbedCLI` CLI executable, and `MbedCoreTests` (linking `mlx-swift` and `mlx-swift-lm` when built via `scripts/build_native_mlx.sh` with `MBED_ENABLE_NATIVE_MLX=1` or opened in Xcode, while keeping bare `swift build` / `swift test` fast and offline). |
 | `scripts/build_native_mlx.sh` | Helper script (`build` \| `test` \| `cli` \| `app`) verifying `mlx-swift` submodules and building/running `mbed` with `MBED_ENABLE_NATIVE_MLX=1` via `xcodebuild` (so the Metal shader bundle `default.metallib` is compiled). |
 | `Sources/MbedCore/Domain/Artifact.swift` | `ArtifactKind`, `ArtifactSpan`, `Artifact`, `EmbeddedChunk`, `ContentFingerprint`, and `SearchHit`. |
 | `Sources/MbedCore/Engine/EmbeddingEngine.swift` | `EmbeddingEngine` protocol, `EmbeddingTask` (all 10 `EmbeddingGemma 2` prompts + `documentPrompt(title:text:)`), `EngineBackend`, `VideoWindowSampling`, zero-copy `EmbeddingPart.mediaURL`, and `Matryoshka` (`vDSP` L2 norm + cosine). |
@@ -43,14 +43,14 @@ Operating guide for `mbed` — a native macOS Swift 6 package and desktop applic
 | `Sources/MbedCore/Pipeline/FolderWatcher.swift` | `FSEventStream` directory watcher (`FolderWatcher`) for auto-indexing watched folders on file changes. |
 | `Sources/MbedCore/Store/VectorStore.swift` | SQLite (`WAL`) vector store with `(byte_count, modified_ms, window_sampling, model_id)` invalidation, MRL slicing, parent-artifact deduplication, `watched_folders` persistence, and `pruneMissingArtifacts`. |
 | `Sources/MbedCore/IndexCoordinator.swift` | Coordinator driving folder indexing, deleted-file pruning, opt-in video soundtrack indexing (`loadAudioFromVideo`), and hybrid text + example-artifact search with `taskOverride`. |
-| `Sources/MbedApp/MbedApp.swift` | Native SwiftUI macOS app with engine switcher (`.nativeMLX` default when `MLXVLM` is linked), query task picker, **Stop** button, watched folders, artifact grid, and inspector with `AVPlayerView` for video/audio and clickable `frameTimes` jump pills. |
-| `Sources/MbedCLI/main.swift` | CLI for `status`, `inspect-checkpoint`, `index`, `search` (`--task`, `--dim`, `--engine`), and `watched` (`.nativeMLX` default when `MLXVLM` is linked). |
+| `Sources/MbedApp/MbedApp.swift` | Native 3-column SwiftUI macOS desktop app (`mbed-app`) with engine switcher (`.nativeMLX` default when `MLXVLM` is linked), query task picker, **Stop** button, watched folders, artifact grid with hybrid example attachment & drag-and-drop indexing, and inspector with `AVPlayerView` for video/audio and clickable `frameTimes` jump pills. |
+| `Sources/MbedCLI/main.swift` | CLI (`mbed-cli`) for `status`, `inspect-checkpoint`, `index`, `search` (`--task`, `--dim`, `--engine`), and `watched` (`.nativeMLX` default when `MLXVLM` is linked). |
 | `Tests/MbedCoreTests/MbedCoreTests.swift` | 15 unit tests covering `Matryoshka`, `WindowPlanner`, live `AVAssetWriter` MP4 candidate extraction & frame decoding, live 16 kHz WAV synthesis & 30s audio windowing, `PDFKit` page chunking, `HeylookMLXEngine` batching & HTTP wire parity, `VectorStore` invalidation & pruning, `FolderWatcher`, `CheckpointDescriptor`, and live in-process `MLXSwiftLMEmbeddingGemma2Engine` GPU embedding. |
 
 ## Commands
 
 - Build standalone with in-process MLX Swift + Metal shaders: `./scripts/build_native_mlx.sh build`
 - Test standalone with in-process MLX Swift + Metal shaders: `./scripts/build_native_mlx.sh test`
-- Run standalone CLI: `./scripts/build_native_mlx.sh cli status | inspect-checkpoint | index <dir> | search <query> | watched`
-- Run standalone macOS app: `./scripts/build_native_mlx.sh app`
-- Lightweight HTTP-only SwiftPM build/test: `MBED_DISABLE_NATIVE_MLX=1 swift build` / `MBED_DISABLE_NATIVE_MLX=1 swift test`
+- Launch standalone native macOS desktop app (`MbedApp`): `./scripts/build_native_mlx.sh app` (or open `Package.swift` in Xcode and run the `mbed-app` scheme)
+- Run standalone CLI (`MbedCLI`): `./scripts/build_native_mlx.sh cli status | inspect-checkpoint | index <dir> | search <query> | watched`
+- Lightweight offline SwiftPM build/test (HTTP engine only, skips Metal shaders): `swift build` / `swift test`

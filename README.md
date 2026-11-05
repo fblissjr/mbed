@@ -18,8 +18,12 @@
 - **Dual MLX Execution Architecture (Self-Contained In-Process MLX Default)**:
   - **Option B (`NativeMLXEmbeddingGemma2` & `MLXSwiftLMEmbeddingGemma2Engine`, default when built with `MLXVLM`)**: Runs 100% in-process on Apple Silicon GPU via `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding` and `MLXLMCommon.EmbeddingGemma2` (`./scripts/build_native_mlx.sh`), with on-demand vision/audio component loading (`componentLoading: .onFirstUse`), Metal bicubic resize (`embedding_gemma2_resize_axis`), direct 2D position table gather, and `UserInput.Video.frames(...)` window embedding — no external server required.
   - **Option A (`HeylookMLXEngine`)**: Actor targeting `heylookllm`'s `POST /v1/embeddings`, `GET /v1/models` capability discovery (`fetchCapabilities`), client-side batch planning (`planBatches`: `<= 16` items, `<= 192 MiB` raw media bytes), and request cancellation (`DELETE /v1/requests/{id}`).
-- **Native macOS Desktop App (`MbedApp`) & Watched Folders**:
-  - 3-column `NavigationSplitView` with engine switcher, query task picker, **Stop** button for in-flight indexing cancellation, clickable millisecond `frameTimes` jump pills in `InspectorView`, inline `AVPlayerView` for both `.video` and `.audio` hits, and persisted watched folders with `FSEvents` auto-indexing (`FolderWatcher`) and deleted-file pruning (`pruneMissingArtifacts`).
+- **Native macOS Desktop Frontend (`MbedApp` / `mbed-app`) & CLI (`MbedCLI` / `mbed-cli`)**:
+  - **Desktop App (`MbedApp`)**: 3-column SwiftUI `NavigationSplitView`:
+    - *Left Sidebar*: Engine switcher (`In-Process MLX` default vs `Heylook HTTP`), **Index Files / Folders…** button, **Stop** button for in-flight indexing cancellation, persisted watched folders with `FSEvents` auto-indexing (`FolderWatcher`) and deleted-file pruning (`pruneMissingArtifacts`), video sampling picker (`1 fps`, `Content (4 fps)`, `Off`), **Include Video Soundtrack** toggle, modality filter, **Query Task** picker, and Matryoshka dimension picker (`768d`, `512d`, `256d`, `128d`).
+    - *Center Grid*: Search bar with optional **Attach Example…** (hybrid text + image/video/audio query), drag-and-drop indexing, and deduplicated artifact cards showing top similarity score and matched span badge.
+    - *Right Inspector*: Inline `AVPlayerView` for `.video` and `.audio` hits with automatic seeking to the matched window, clickable millisecond `frameTimes` jump pills (`01:04.5`), ranked `spanMatches` list, **Reveal in Finder**, and **Open**.
+  - **CLI (`mbed-cli`)**: `status`, `watched`, `inspect-checkpoint`, `index` (`--sampling`, `--audio-from-video`, `--engine`, `--checkpoint`), and `search` (`--dim`, `--kind`, `--task`, `--engine`).
 
 ## Commands
 
@@ -28,16 +32,20 @@
 ./scripts/build_native_mlx.sh build
 ./scripts/build_native_mlx.sh test
 
-# Run the standalone in-process MLX CLI or macOS desktop app
+# Launch the standalone native SwiftUI macOS desktop app (MbedApp)
+./scripts/build_native_mlx.sh app
+# (Or open Package.swift in Xcode, select the mbed-app scheme, and press Cmd+R)
+
+# Run the standalone in-process MLX CLI (MbedCLI)
 ./scripts/build_native_mlx.sh cli status
-./scripts/build_native_mlx.sh cli inspect-checkpoint /Users/fredbliss/Storage/llms/google/embeddinggemma-2-MLX-BF16
+./scripts/build_native_mlx.sh cli inspect-checkpoint
 ./scripts/build_native_mlx.sh cli index /path/to/media --sampling content --audio-from-video
 ./scripts/build_native_mlx.sh cli search "person walking across street" --dim 256 --task query
-./scripts/build_native_mlx.sh app
+./scripts/build_native_mlx.sh cli watched
 
 # Lightweight HTTP-only SwiftPM build & test (skips Metal shader compilation)
-MBED_DISABLE_NATIVE_MLX=1 swift build
-MBED_DISABLE_NATIVE_MLX=1 swift test
+swift build
+swift test
 ```
 
 ## Project Status & Backlog
