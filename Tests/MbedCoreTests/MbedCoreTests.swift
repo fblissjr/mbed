@@ -574,6 +574,33 @@ struct MbedCoreTests {
         #expect(flag.isTrue())
     }
 
+    @Test("Track 1.1 & 1.2: Standalone in-process MLXSwiftLMEmbeddingGemma2Engine embeds text & titled documents on Metal GPU")
+    func testInProcessMLXSwiftLMEmbeddingGemma2Engine() async throws {
+        #if canImport(MLXVLM)
+        #expect(NativeMLXEmbeddingGemma2.isAvailableInProcess)
+        let checkpointURL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
+        guard FileManager.default.fileExists(atPath: checkpointURL.appendingPathComponent("config.json").path) else {
+            return
+        }
+        let engine = MLXSwiftLMEmbeddingGemma2Engine(checkpointURL: checkpointURL)
+        let outputs = try await engine.embedBatch(
+            [
+                .text("Swift actor concurrency and Metal shaders", task: .document, title: "Concurrency.md"),
+                .text("how do actors work in Swift?", task: .query),
+                .text("lasagna recipe with ricotta cheese", task: .document, title: "Cooking.md"),
+            ],
+            dimensions: 768
+        )
+        #expect(outputs.count == 3)
+        #expect(outputs[0].vector.count == 768)
+        let simRelevant = Matryoshka.cosine(outputs[1].vector, outputs[0].vector)
+        let simIrrelevant = Matryoshka.cosine(outputs[1].vector, outputs[2].vector)
+        #expect(simRelevant > simIrrelevant)
+        #else
+        #expect(!NativeMLXEmbeddingGemma2.isAvailableInProcess)
+        #endif
+    }
+
     private static func writeSyntheticMP4(
         to url: URL,
         width: Int,

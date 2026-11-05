@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 @MainActor
 @Observable
 final class MbedViewModel {
-    var selectedBackend: EngineBackend = .heylook
+    var selectedBackend: EngineBackend = NativeMLXEmbeddingGemma2.isAvailableInProcess ? .nativeMLX : .heylook
     var serverURLString: String = "http://127.0.0.1:8000"
     var checkpointPath: String = NativeMLXEmbeddingGemma2.defaultCheckpointURL.path
     var serverCapabilities: HeylookServerCapabilities?

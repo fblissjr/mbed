@@ -3,10 +3,11 @@ import AVFoundation
 import CoreImage
 import Foundation
 
-#if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
+#if canImport(MLXVLM)
 import MLXHuggingFace
 import MLXLMCommon
 import MLXVLM
+import Tokenizers
 #endif
 
 /// Standalone MLX Swift integration for `EmbeddingGemma 2` (`embedding_gemma2`).
@@ -160,7 +161,7 @@ public enum NativeMLXEmbeddingGemma2 {
     }
 }
 
-#if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
+#if canImport(MLXVLM)
 /// In-process `EmbeddingEngine` backed directly by `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding`.
 ///
 /// When `mbed` is linked with local `/Users/fredbliss/mlx/mlx-swift` and `/Users/fredbliss/mlx/mlx-swift-lm`
@@ -211,7 +212,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         if let cachedEmbedder {
             return cachedEmbedder
         }
-        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader
+        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader()
         let loaded = try await MLXVLM.EmbeddingGemma2Embedding(
             modelDirectory: checkpointURL,
             tokenizerLoader: loader,
@@ -235,6 +236,48 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         poolingModeMeanTokens: true
     )
 
+    private enum ResolvedPart: Sendable {
+        case text(String)
+        case image(URL)
+        case video(URL)
+        case audio(URL)
+    }
+
+    nonisolated private static func buildVLMInput(
+        parts: [ResolvedPart],
+        title: String?
+    ) -> sending MLXVLM.EmbeddingInput {
+        let vlmParts: [MLXVLM.EmbeddingInput.Part] = parts.map { part in
+            switch part {
+            case .text(let s): return .text(s)
+            case .image(let url): return .image(.url(url))
+            case .video(let url): return .video(.url(url))
+            case .audio(let url): return .audio(.url(url))
+            }
+        }
+        return MLXVLM.EmbeddingInput(vlmParts, title: title)
+    }
+
+    nonisolated private static func buildWindowVLMInput(
+        frames: [(time: Double, image: CGImage)],
+        audioWAVURL: URL?
+    ) -> sending MLXVLM.EmbeddingInput {
+        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)
+        let ciOptions: [CIImageOption: Any] = sRGB.map { [.colorSpace: $0] } ?? [:]
+        let videoFrames = frames.map { frame in
+            UserInput.VideoFrame(
+                image: .ciImage(CIImage(cgImage: frame.image, options: ciOptions)),
+                timeStamp: CMTime(seconds: frame.time, preferredTimescale: 90_000)
+            )
+        }
+        var winParts: [MLXVLM.EmbeddingInput.Part] = [.video(.frames(videoFrames))]
+        if let audioWAVURL {
+            winParts.append(.text(" "))
+            winParts.append(.audio(.url(audioWAVURL)))
+        }
+        return MLXVLM.EmbeddingInput(winParts)
+    }
+
     public func embedBatch(
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
@@ -246,7 +289,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         for item in inputs {
             try Task.checkCancellation()
             let vlmTask = Self.mapTask(item.task)
-            var vlmParts: [MLXVLM.EmbeddingInput.Part] = []
+            var resolvedParts: [ResolvedPart] = []
             var tempURLs: [URL] = []
             defer {
                 for url in tempURLs {
@@ -260,7 +303,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             for part in item.parts {
                 switch part {
                 case .text(let s):
-                    vlmParts.append(.text(s))
+                    resolvedParts.append(.text(s))
                 case let .media(kind, _, data, url, windowSampling):
                     let resolvedURL: URL
                     if let url {
@@ -277,14 +320,14 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
 
                     switch kind {
                     case .image:
-                        vlmParts.append(.image(.url(resolvedURL)))
+                        resolvedParts.append(.image(resolvedURL))
                     case .video:
-                        vlmParts.append(.video(.url(resolvedURL)))
+                        resolvedParts.append(.video(resolvedURL))
                         if windowSampling != .off && windowedVideoRequest == nil {
                             windowedVideoRequest = (resolvedURL, windowSampling)
                         }
                     case .audio:
-                        vlmParts.append(.audio(.url(resolvedURL)))
+                        resolvedParts.append(.audio(resolvedURL))
                         hasCompanionAudio = true
                     default:
                         break
@@ -293,7 +336,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             }
 
             let primary = try await embedder.embed(
-                MLXVLM.EmbeddingInput(vlmParts, title: item.title),
+                Self.buildVLMInput(parts: resolvedParts, title: item.title),
                 task: vlmTask,
                 dimensions: dimensions
             )
@@ -342,8 +385,6 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             ? ((try? await ArtifactProcessor.decodeMonoPCM(for: videoURL)) ?? [])
             : []
 
-        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)
-        let ciOptions: [CIImageOption: Any] = sRGB.map { [.colorSpace: $0] } ?? [:]
         var out: [EmbeddedOutput.WindowVector] = []
         out.reserveCapacity(planned.count)
 
@@ -354,13 +395,6 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                 at: win.frameTimes
             )
             guard !decoded.isEmpty else { continue }
-            let videoFrames = decoded.map { frame in
-                UserInput.VideoFrame(
-                    image: .ciImage(CIImage(cgImage: frame.image, options: ciOptions)),
-                    timeStamp: CMTime(seconds: frame.time, preferredTimescale: 90_000)
-                )
-            }
-            var winParts: [MLXVLM.EmbeddingInput.Part] = [.video(.frames(videoFrames))]
             var tempAudioURL: URL?
             defer {
                 if let tempAudioURL {
@@ -378,12 +412,10 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                     .appendingPathComponent("mbed-win-audio-\(UUID().uuidString).wav")
                 if (try? sliceWAV.write(to: wavURL)) != nil {
                     tempAudioURL = wavURL
-                    winParts.append(.text(" "))
-                    winParts.append(.audio(.url(wavURL)))
                 }
             }
             let vec = try await embedder.embed(
-                MLXVLM.EmbeddingInput(winParts),
+                Self.buildWindowVLMInput(frames: decoded, audioWAVURL: tempAudioURL),
                 task: task,
                 dimensions: dimensions
             )

@@ -2,7 +2,25 @@
 import Foundation
 import PackageDescription
 
-let enableNativeMLX = ProcessInfo.processInfo.environment["MBED_ENABLE_NATIVE_MLX"] == "1"
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let mlxCmakePath = packageRoot
+    .appendingPathComponent("../../mlx/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
+    .standardizedFileURL
+    .path
+
+let env = ProcessInfo.processInfo.environment
+let isXcode = (env["__CFBundleIdentifier"]?.contains("Xcode") == true)
+    || (env["XPC_SERVICE_NAME"]?.contains("Xcode") == true)
+    || (env["DT_TOOLCHAIN_DIR"] != nil)
+let enableNativeMLX: Bool = {
+    if env["MBED_DISABLE_NATIVE_MLX"] == "1" || env["MBED_ENABLE_NATIVE_MLX"] == "0" {
+        return false
+    }
+    if env["MBED_ENABLE_NATIVE_MLX"] == "1" || isXcode {
+        return FileManager.default.fileExists(atPath: mlxCmakePath)
+    }
+    return false
+}()
 
 var packageDependencies: [Package.Dependency] = []
 var coreTargetDependencies: [Target.Dependency] = []
@@ -11,11 +29,17 @@ if enableNativeMLX {
     packageDependencies.append(contentsOf: [
         .package(path: "../../mlx/mlx-swift"),
         .package(path: "../../mlx/mlx-swift-lm"),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers",
+            .upToNextMajor(from: "1.1.0")
+        ),
     ])
     coreTargetDependencies.append(contentsOf: [
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
         .product(name: "MLXVLM", package: "mlx-swift-lm"),
+        .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+        .product(name: "Transformers", package: "swift-transformers"),
     ])
 }
 

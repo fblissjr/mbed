@@ -16,10 +16,40 @@ if [[ -z "${MLX_SWIFT_DIR}" || ! -f "${MLX_SWIFT_DIR}/Source/Cmlx/mlx/CMakeLists
 fi
 
 ACTION="${1:-build}"
+shift || true
 export MBED_ENABLE_NATIVE_MLX=1
 
 cd "${REPO_ROOT}"
-xcodebuild "${ACTION}" \
-  -scheme mbed-Package \
-  -destination 'platform=macOS' \
-  -skipPackagePluginValidation
+
+find_products_dir() {
+  xcodebuild -scheme mbed-Package -destination 'platform=macOS' -skipPackagePluginValidation -showBuildSettings 2>/dev/null \
+    | awk -F' = ' '/BUILT_PRODUCTS_DIR/ {print $2; exit}'
+}
+
+case "${ACTION}" in
+  build|test)
+    xcodebuild "${ACTION}" \
+      -scheme mbed-Package \
+      -destination 'platform=macOS' \
+      -skipPackagePluginValidation \
+      "$@"
+    ;;
+  cli)
+    PRODUCTS_DIR="$(find_products_dir)"
+    if [[ ! -x "${PRODUCTS_DIR}/mbed-cli" ]]; then
+      xcodebuild build -scheme mbed-Package -destination 'platform=macOS' -skipPackagePluginValidation
+    fi
+    exec "${PRODUCTS_DIR}/mbed-cli" "$@"
+    ;;
+  app)
+    PRODUCTS_DIR="$(find_products_dir)"
+    if [[ ! -x "${PRODUCTS_DIR}/mbed-app" ]]; then
+      xcodebuild build -scheme mbed-Package -destination 'platform=macOS' -skipPackagePluginValidation
+    fi
+    exec "${PRODUCTS_DIR}/mbed-app" "$@"
+    ;;
+  *)
+    echo "Usage: $0 [build|test|cli <args...>|app]" >&2
+    exit 1
+    ;;
+esac

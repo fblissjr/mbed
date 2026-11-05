@@ -122,11 +122,13 @@ struct MbedCLI {
     }
 
     private static func makeEngine(args: [String], serverURL: URL) -> any EmbeddingEngine {
-        var backend: EngineBackend = .heylook
+        var backend: EngineBackend = NativeMLXEmbeddingGemma2.isAvailableInProcess ? .nativeMLX : .heylook
         if let idx = args.firstIndex(of: "--engine"), idx + 1 < args.count {
             let val = args[idx + 1].lowercased()
             if val == "native" || val == "native-mlx" || val == "mlx" {
                 backend = .nativeMLX
+            } else if val == "heylook" || val == "http" {
+                backend = .heylook
             }
         }
         var checkpointURL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
