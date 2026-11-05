@@ -213,10 +213,18 @@ final class MbedViewModel {
 struct MbedApp: App {
     @State private var viewModel = MbedViewModel()
 
+    init() {
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
     var body: some Scene {
         WindowGroup("mbed — Multimodal Embedding Finder") {
             ContentView(viewModel: viewModel)
                 .frame(minWidth: 1020, minHeight: 660)
+                .onAppear {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
         }
     }
 }
