@@ -134,6 +134,8 @@ public struct Artifact: Codable, Identifiable, Hashable, Sendable {
     public let url: URL
     public let title: String
     public let fingerprint: ContentFingerprint
+    public let windowSamplingRaw: String
+    public let modelID: String
     public let attributes: [String: String]
 
     public init(
@@ -143,6 +145,8 @@ public struct Artifact: Codable, Identifiable, Hashable, Sendable {
         url: URL,
         title: String,
         fingerprint: ContentFingerprint,
+        windowSamplingRaw: String = "",
+        modelID: String = "",
         attributes: [String: String] = [:]
     ) {
         self.id = id
@@ -151,7 +155,13 @@ public struct Artifact: Codable, Identifiable, Hashable, Sendable {
         self.url = url
         self.title = title
         self.fingerprint = fingerprint
+        self.windowSamplingRaw = windowSamplingRaw
+        self.modelID = modelID
         self.attributes = attributes
+    }
+
+    public var includesAudioTrack: Bool {
+        modelID.hasSuffix("+audio")
     }
 }
 
@@ -183,6 +193,21 @@ public struct EmbeddedChunk: Codable, Identifiable, Sendable {
     }
 }
 
+/// Describes the specific multimodal feature / tower that produced a scored chunk vector.
+public struct ScoredFeatureSummary: Sendable, Hashable {
+    public let title: String
+    public let subtitle: String
+    public let systemImage: String
+    public let isAudioTrack: Bool
+
+    public init(title: String, subtitle: String, systemImage: String, isAudioTrack: Bool = false) {
+        self.title = title
+        self.subtitle = subtitle
+        self.systemImage = systemImage
+        self.isAudioTrack = isAudioTrack
+    }
+}
+
 /// A deduplicated search result grouped by parent `Artifact`.
 /// Preserves the best-scoring span so the UI never shows duplicate cards for the same file,
 /// while allowing instant jump-to-timestamp or jump-to-line on every matching span.
@@ -192,12 +217,112 @@ public struct SearchHit: Identifiable, Hashable, Sendable {
         public let span: ArtifactSpan
         public let score: Float
         public let previewText: String?
+        public let scoresByDimension: [Int: Float]
 
-        public init(chunkID: String, span: ArtifactSpan, score: Float, previewText: String? = nil) {
+        public init(
+            chunkID: String,
+            span: ArtifactSpan,
+            score: Float,
+            previewText: String? = nil,
+            scoresByDimension: [Int: Float] = [:]
+        ) {
             self.chunkID = chunkID
             self.span = span
             self.score = score
             self.previewText = previewText
+            self.scoresByDimension = scoresByDimension
+        }
+
+        public var isAudioTrackChunk: Bool {
+            chunkID.contains("#audio-t=")
+        }
+
+        /// Summarizes which modality tower and sampling strategy produced this chunk's embedding.
+        public func scoredFeature(for artifact: Artifact) -> ScoredFeatureSummary {
+            let samplingBadge: String
+            switch artifact.windowSamplingRaw {
+            case "content": samplingBadge = "Content Novelty"
+            case "fps": samplingBadge = "Fixed 1 fps"
+            default: samplingBadge = "Whole"
+            }
+
+            switch artifact.kind {
+            case .video:
+                if isAudioTrackChunk {
+                    return ScoredFeatureSummary(
+                        title: "Audio Soundtrack",
+                        subtitle: "16 kHz Mono WAV · Conformer Tower",
+                        systemImage: "waveform",
+                        isAudioTrack: true
+                    )
+                }
+                if span == .whole {
+                    if artifact.includesAudioTrack {
+                        return ScoredFeatureSummary(
+                            title: "Whole Video + Audio",
+                            subtitle: "Vision (<=140 tokens/f) + 16 kHz Audio",
+                            systemImage: "film.stack"
+                        )
+                    }
+                    return ScoredFeatureSummary(
+                        title: "Whole Video",
+                        subtitle: "Vision Tower (<=140 soft tokens/frame)",
+                        systemImage: "film"
+                    )
+                }
+                let frameCount = span.frameTimes.count
+                let countLabel = frameCount > 0 ? "\(frameCount) frames" : "32s window"
+                return ScoredFeatureSummary(
+                    title: "Video Window (\(countLabel))",
+                    subtitle: "\(samplingBadge) · Vision Tower",
+                    systemImage: "film"
+                )
+
+            case .audio:
+                let title = (span == .whole) ? "Whole Audio (<=30s)" : "Audio Window (30s)"
+                return ScoredFeatureSummary(
+                    title: title,
+                    subtitle: "16 kHz Mono PCM · Conformer Tower",
+                    systemImage: "waveform",
+                    isAudioTrack: true
+                )
+
+            case .image:
+                return ScoredFeatureSummary(
+                    title: "Image Patch Grid",
+                    subtitle: "Aspect-Preserving Vision (<=280 soft tokens)",
+                    systemImage: "photo"
+                )
+
+            case .document:
+                let hasText = !(previewText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if hasText {
+                    return ScoredFeatureSummary(
+                        title: span == .whole ? "Whole Document Text" : "PDF Page Text",
+                        subtitle: "title: \(artifact.title) | text: ...",
+                        systemImage: "doc.text"
+                    )
+                }
+                return ScoredFeatureSummary(
+                    title: "Rendered Page Image",
+                    subtitle: "PDFKit Page Raster · Vision Tower",
+                    systemImage: "doc.richtext"
+                )
+
+            case .code:
+                return ScoredFeatureSummary(
+                    title: span == .whole ? "Whole Source File" : "Code Line Span",
+                    subtitle: "title: \(artifact.title) | text: ...",
+                    systemImage: "chevron.left.forwardslash.chevron.right"
+                )
+
+            case .text:
+                return ScoredFeatureSummary(
+                    title: span == .whole ? "Whole Text Note" : "Text Line Span",
+                    subtitle: "title: \(artifact.title) | text: ...",
+                    systemImage: "doc.plaintext"
+                )
+            }
         }
     }
 
@@ -223,5 +348,17 @@ public struct SearchHit: Identifiable, Hashable, Sendable {
         self.spanMatches = spanMatches
         self.thumbnailJPEG = thumbnailJPEG
         self.previewText = previewText
+    }
+
+    public var bestMatch: SpanMatch? {
+        spanMatches.first
+    }
+
+    public var bestScoredFeature: ScoredFeatureSummary {
+        if let first = spanMatches.first {
+            return first.scoredFeature(for: artifact)
+        }
+        return SpanMatch(chunkID: "\(artifact.id)#whole", span: bestSpan, score: bestScore, previewText: previewText)
+            .scoredFeature(for: artifact)
     }
 }

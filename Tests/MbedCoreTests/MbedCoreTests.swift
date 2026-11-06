@@ -239,6 +239,11 @@ struct MbedCoreTests {
         #expect(topHit.artifact.url.lastPathComponent == "demo_clip.mp4")
         #expect(topHit.bestSpan == .temporal(start: 32.0, end: 64.0, frameTimes: [32.0, 33.0, 34.0]))
         #expect(topHit.spanMatches.count == 3)
+        #expect(topHit.artifact.windowSamplingRaw == "fps")
+        #expect(topHit.bestScoredFeature.title == "Video Window (3 frames)")
+        #expect(topHit.bestScoredFeature.subtitle.contains("Fixed 1 fps"))
+        let bestMatch = try #require(topHit.bestMatch)
+        #expect(bestMatch.scoresByDimension.keys.sorted() == [128, 256, 512, 768])
     }
 
     @Test("Track 4.1: VectorStore invalidates cached artifacts when windowSampling or modelID changes")

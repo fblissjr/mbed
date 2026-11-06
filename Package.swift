@@ -11,7 +11,6 @@ let mlxCmakePath = packageRoot
 let env = ProcessInfo.processInfo.environment
 let isXcode = (env["__CFBundleIdentifier"]?.contains("Xcode") == true)
     || (env["XPC_SERVICE_NAME"]?.contains("Xcode") == true)
-    || (env["DT_TOOLCHAIN_DIR"] != nil)
 let enableNativeMLX: Bool = {
     if env["MBED_DISABLE_NATIVE_MLX"] == "1" || env["MBED_ENABLE_NATIVE_MLX"] == "0" {
         return false

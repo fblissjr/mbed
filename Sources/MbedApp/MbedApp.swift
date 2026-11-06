@@ -26,7 +26,61 @@ final class MbedViewModel {
     var isIndexing: Bool = false
     var artifactCount: Int = 0
     var chunkCount: Int = 0
+    var countsByKind: [ArtifactKind: Int] = [:]
     var watchedFolders: [VectorStore.WatchedFolder] = []
+
+    var hasActiveQuery: Bool {
+        !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || queryAttachmentURL != nil
+    }
+
+    var effectiveQueryTask: EmbeddingTask {
+        selectedTaskOverride ?? (selectedKindFilter == .code ? .codeRetrieval : .query)
+    }
+
+    var activeQueryTowersLabel: String {
+        let hasText = !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let attachmentKind = queryAttachmentURL.flatMap { ArtifactKind.detect(from: $0) }
+        switch (hasText, attachmentKind) {
+        case (true, nil):
+            return "Text Tower"
+        case (true, .some(.image)):
+            return "Text + Vision (Image <=280 tokens)"
+        case (true, .some(.video)):
+            return "Text + Vision (Video <=140 tokens/f)"
+        case (true, .some(.audio)):
+            return "Text + Audio (16 kHz Conformer)"
+        case (true, .some(let k)):
+            return "Text + \(k.rawValue.capitalized)"
+        case (false, .some(.image)):
+            return "Vision Tower (Image <=280 tokens)"
+        case (false, .some(.video)):
+            return "Vision Tower (Video <=140 tokens/f)"
+        case (false, .some(.audio)):
+            return "Audio Tower (16 kHz Conformer)"
+        case (false, .some(let k)):
+            return "Text Tower (\(k.rawValue.capitalized))"
+        case (false, nil):
+            return "Text / Vision / Audio"
+        }
+    }
+
+    var activeQueryPromptLabel: String {
+        let hasText = !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasText, let url = queryAttachmentURL, let kind = ArtifactKind.detect(from: url), kind.isMedia {
+            return "Pure Media (<bos><|media|><eos>)"
+        }
+        return effectiveQueryTask.prefixText.trimmingCharacters(in: .whitespaces)
+    }
+
+    var activeWindowFeaturesLabel: String {
+        let samplingText: String
+        switch selectedSampling {
+        case .fps: samplingText = "Video: Fixed 1 fps (32s)"
+        case .content: samplingText = "Video: Content Novelty (32s)"
+        case .off: samplingText = "Video: Whole Only"
+        }
+        return loadAudioFromVideo ? "\(samplingText) + 16 kHz Soundtrack" : samplingText
+    }
 
     private var store: VectorStore?
     private var engine: (any EmbeddingEngine)?
@@ -85,6 +139,7 @@ final class MbedViewModel {
         guard let store, let stats = try? store.stats() else { return }
         artifactCount = stats.artifactCount
         chunkCount = stats.chunkCount
+        countsByKind = stats.countsByKind
     }
 
     func refreshWatchedFolders() {
@@ -256,8 +311,14 @@ struct SidebarView: View {
                 Button {
                     viewModel.selectedKindFilter = nil
                 } label: {
-                    Label("All Artifacts", systemImage: "square.grid.2x2")
-                        .fontWeight(viewModel.selectedKindFilter == nil ? .semibold : .regular)
+                    HStack {
+                        Label("All Artifacts", systemImage: "square.grid.2x2")
+                            .fontWeight(viewModel.selectedKindFilter == nil ? .semibold : .regular)
+                        Spacer()
+                        Text("\(viewModel.artifactCount)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .buttonStyle(.plain)
 
@@ -265,10 +326,23 @@ struct SidebarView: View {
                     Button {
                         viewModel.selectedKindFilter = kind
                     } label: {
-                        Label(kind.rawValue.capitalized, systemImage: iconName(for: kind))
-                            .fontWeight(viewModel.selectedKindFilter == kind ? .semibold : .regular)
+                        HStack {
+                            Label(kind.rawValue.capitalized, systemImage: iconName(for: kind))
+                                .fontWeight(viewModel.selectedKindFilter == kind ? .semibold : .regular)
+                            Spacer()
+                            if let count = viewModel.countsByKind[kind], count > 0 {
+                                Text("\(count)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                     .buttonStyle(.plain)
+                }
+            }
+            .onChange(of: viewModel.selectedKindFilter) { _, _ in
+                if viewModel.hasActiveQuery {
+                    Task { await viewModel.runSearch() }
                 }
             }
 
@@ -287,6 +361,12 @@ struct SidebarView: View {
                         Text("\(dim)d").tag(dim)
                     }
                 }
+                .onChange(of: viewModel.selectedDimensions) { _, _ in
+                    if viewModel.hasActiveQuery {
+                        Task { await viewModel.runSearch() }
+                    }
+                }
+
                 Picker("Query Task", selection: $viewModel.selectedTaskOverride) {
                     Text("Auto (Search / Code)").tag(Optional<EmbeddingTask>.none)
                     Text("Search Result").tag(Optional<EmbeddingTask>.some(.query))
@@ -296,6 +376,11 @@ struct SidebarView: View {
                     Text("Sentence Similarity").tag(Optional<EmbeddingTask>.some(.sts))
                     Text("Clustering").tag(Optional<EmbeddingTask>.some(.clustering))
                     Text("Classification").tag(Optional<EmbeddingTask>.some(.classification))
+                }
+                .onChange(of: viewModel.selectedTaskOverride) { _, _ in
+                    if viewModel.hasActiveQuery {
+                        Task { await viewModel.runSearch() }
+                    }
                 }
                 Picker("Video Sampling", selection: $viewModel.selectedSampling) {
                     Text("Fixed FPS (32s)").tag(VideoWindowSampling.fps)
@@ -462,6 +547,8 @@ struct SearchAndResultsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                ScoringPipelineBanner(viewModel: viewModel)
+
                 HStack(spacing: 8) {
                     Text(viewModel.statusMessage)
                         .font(.caption)
@@ -491,7 +578,7 @@ struct SearchAndResultsView: View {
                 )
             } else {
                 List(viewModel.hits, selection: $viewModel.selectedHit) { hit in
-                    HitRowView(hit: hit)
+                    HitRowView(hit: hit, activeDimensions: viewModel.selectedDimensions)
                         .tag(hit)
                 }
                 .onChange(of: viewModel.selectedHit) { _, _ in
@@ -512,38 +599,119 @@ struct SearchAndResultsView: View {
     }
 }
 
-struct HitRowView: View {
-    let hit: SearchHit
+struct ScoringPipelineBanner: View {
+    let viewModel: MbedViewModel
 
     var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                FeaturePill(
+                    icon: "cpu",
+                    label: "Query: \(viewModel.activeQueryTowersLabel)",
+                    tint: .blue
+                )
+                FeaturePill(
+                    icon: "text.quote",
+                    label: viewModel.activeQueryPromptLabel,
+                    tint: .purple,
+                    monospaced: true
+                )
+                FeaturePill(
+                    icon: "slider.horizontal.below.rectangle",
+                    label: "Matryoshka: \(viewModel.selectedDimensions)d Cosine",
+                    tint: .teal
+                )
+                FeaturePill(
+                    icon: "film.stack",
+                    label: viewModel.activeWindowFeaturesLabel,
+                    tint: .orange
+                )
+            }
+        }
+    }
+}
+
+struct FeaturePill: View {
+    let icon: String
+    let label: String
+    var tint: Color = .accentColor
+    var monospaced: Bool = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(label)
+                .font(monospaced ? .system(.caption2, design: .monospaced) : .caption2)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .foregroundStyle(tint)
+        .background(tint.opacity(0.12))
+        .clipShape(Capsule())
+    }
+}
+
+struct HitRowView: View {
+    let hit: SearchHit
+    let activeDimensions: Int
+
+    var body: some View {
+        let bestFeature = hit.bestScoredFeature
+        let hasAudioMatch = hit.spanMatches.contains(where: \.isAudioTrackChunk)
+        let hasVisualWindowMatch = hit.spanMatches.contains { !$0.isAudioTrackChunk && $0.span != .whole }
+
         HStack(spacing: 12) {
             ThumbnailBadge(hit: hit)
                 .frame(width: 64, height: 48)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
                     Text(hit.artifact.title)
                         .font(.headline)
                         .lineLimit(1)
                     Spacer()
-                    Text(String(format: "%.3f", hit.bestScore))
-                        .font(.system(.caption, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.15))
-                        .clipShape(Capsule())
+                    ScoreBadgeView(score: hit.bestScore, dimensions: activeDimensions)
                 }
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text(hit.artifact.kind.rawValue.uppercased())
                         .font(.caption2)
+                        .fontWeight(.semibold)
                         .foregroundStyle(.secondary)
+
                     Text(hit.bestSpan.displayBadge ?? "Whole")
-                        .font(.caption)
-                        .foregroundStyle(.primary)
+                        .font(.system(.caption, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+
+                    HStack(spacing: 4) {
+                        Image(systemName: bestFeature.systemImage)
+                            .font(.caption2)
+                        Text(bestFeature.title)
+                            .font(.caption)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(bestFeature.isAudioTrack ? Color.orange : Color.accentColor)
+
+                    if hit.artifact.kind == .video && hasAudioMatch && hasVisualWindowMatch {
+                        Text("+ Audio & Vision")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.14))
+                            .foregroundStyle(.orange)
+                            .clipShape(Capsule())
+                    }
+
+                    Spacer()
+
                     if hit.spanMatches.count > 1 {
-                        Text("+\(hit.spanMatches.count - 1) spans")
+                        Text("\(hit.spanMatches.count) scored spans")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -551,6 +719,39 @@ struct HitRowView: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+struct ScoreBadgeView: View {
+    let score: Float
+    let dimensions: Int
+
+    var body: some View {
+        let normalized = Double(max(0, min(1, score)))
+        HStack(spacing: 6) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.18))
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: max(4, geo.size.width * normalized))
+                }
+            }
+            .frame(width: 38, height: 6)
+
+            Text(String(format: "%.3f", score))
+                .font(.system(.caption, design: .monospaced))
+                .fontWeight(.medium)
+
+            Text("\(dimensions)d")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.accentColor.opacity(0.12))
+        .clipShape(Capsule())
     }
 }
 
@@ -589,18 +790,30 @@ struct InspectorView: View {
 
     var body: some View {
         if let hit = viewModel.selectedHit {
-            let activeSpan = hit.spanMatches[safe: viewModel.selectedSpanIndex]?.span ?? hit.bestSpan
+            let activeMatch = hit.spanMatches[safe: viewModel.selectedSpanIndex] ?? hit.bestMatch
+            let activeSpan = activeMatch?.span ?? hit.bestSpan
+            let activeFeature = activeMatch?.scoredFeature(for: hit.artifact) ?? hit.bestScoredFeature
             let activeFrameTimes = activeSpan.frameTimes
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text(hit.artifact.title)
-                        .font(.title3)
-                        .fontWeight(.semibold)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(hit.artifact.title)
+                            .font(.title3)
+                            .fontWeight(.semibold)
 
-                    Text(hit.artifact.url.path)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                        Text(hit.artifact.url.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    ScoredFeatureBreakdownCard(
+                        hit: hit,
+                        activeMatch: activeMatch,
+                        activeFeature: activeFeature,
+                        activeSpan: activeSpan,
+                        selectedDimensions: $viewModel.selectedDimensions
+                    )
 
                     if hit.artifact.kind == .video || hit.artifact.kind == .audio {
                         MacVideoPlayerView(player: player)
@@ -618,9 +831,16 @@ struct InspectorView: View {
 
                         if !activeFrameTimes.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
-                                Text("Sampled Frames (\(activeFrameTimes.count))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                HStack {
+                                    Text("Sampled Vision Frames (\(activeFrameTimes.count))")
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text(samplingModeLabel(for: hit.artifact))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
 
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 6) {
@@ -650,40 +870,71 @@ struct InspectorView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
 
-                    if let snippet = hit.spanMatches[safe: viewModel.selectedSpanIndex]?.previewText ?? hit.previewText {
-                        ScrollView(.horizontal) {
-                            Text(snippet)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .padding(10)
+                    if let snippet = activeMatch?.previewText ?? hit.previewText {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Embedded Text / Transcript Preview")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            ScrollView(.horizontal) {
+                                Text(snippet)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .padding(10)
+                            }
+                            .background(Color.secondary.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
-                        .background(Color.secondary.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Matching Spans (\(hit.spanMatches.count))")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
+                        HStack {
+                            Text("Scored Spans & Features (\(hit.spanMatches.count))")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                            Text("\(viewModel.selectedDimensions)d Cosine")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
 
                         ForEach(Array(hit.spanMatches.enumerated()), id: \.offset) { idx, match in
+                            let feature = match.scoredFeature(for: hit.artifact)
+                            let isSelected = viewModel.selectedSpanIndex == idx
                             Button {
                                 viewModel.selectedSpanIndex = idx
                             } label: {
-                                HStack {
-                                    Text(match.span.displayBadge ?? "Whole")
+                                HStack(spacing: 8) {
+                                    Image(systemName: feature.systemImage)
                                         .font(.caption)
+                                        .foregroundStyle(feature.isAudioTrack ? Color.orange : Color.accentColor)
+                                        .frame(width: 16)
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text(match.span.displayBadge ?? "Whole")
+                                                .font(.system(.caption, design: .monospaced))
+                                                .fontWeight(.semibold)
+                                            Text(feature.title)
+                                                .font(.caption)
+                                                .lineLimit(1)
+                                        }
+                                        Text(feature.subtitle)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+
                                     Spacer()
-                                    Text(String(format: "%.3f", match.score))
-                                        .font(.system(.caption, design: .monospaced))
+
+                                    ScoreBadgeView(score: match.score, dimensions: viewModel.selectedDimensions)
                                 }
-                                .padding(6)
+                                .padding(8)
                                 .background(
-                                    viewModel.selectedSpanIndex == idx
-                                        ? Color.accentColor.opacity(0.2)
-                                        : Color.secondary.opacity(0.08)
+                                    isSelected
+                                        ? Color.accentColor.opacity(0.18)
+                                        : Color.secondary.opacity(0.07)
                                 )
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
                             }
                             .buttonStyle(.plain)
                         }
@@ -699,8 +950,16 @@ struct InspectorView: View {
             ContentUnavailableView(
                 "No Selection",
                 systemImage: "sidebar.right",
-                description: Text("Select a search result to inspect its matching spans or preview media.")
+                description: Text("Select a search result to inspect its scored features, Matryoshka dimension breakdown, and matching spans.")
             )
+        }
+    }
+
+    private func samplingModeLabel(for artifact: Artifact) -> String {
+        switch artifact.windowSamplingRaw {
+        case "content": return "Content Novelty (4 fps -> 1 fps budget)"
+        case "fps": return "Fixed 1 fps (32s window)"
+        default: return "Whole clip"
         }
     }
 
@@ -718,6 +977,129 @@ struct InspectorView: View {
         guard let player else { return }
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+}
+
+struct ScoredFeatureBreakdownCard: View {
+    let hit: SearchHit
+    let activeMatch: SearchHit.SpanMatch?
+    let activeFeature: ScoredFeatureSummary
+    let activeSpan: ArtifactSpan
+    @Binding var selectedDimensions: Int
+
+    var body: some View {
+        let activeScore = activeMatch?.score ?? hit.bestScore
+        let dimScores = activeMatch?.scoresByDimension ?? [:]
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: activeFeature.systemImage)
+                    .font(.title3)
+                    .foregroundStyle(activeFeature.isAudioTrack ? Color.orange : Color.accentColor)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        (activeFeature.isAudioTrack ? Color.orange : Color.accentColor).opacity(0.14)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(activeFeature.title)
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                        Text(activeSpan.displayBadge ?? "Whole")
+                            .font(.system(.caption2, design: .monospaced))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.15))
+                            .clipShape(Capsule())
+                    }
+                    Text(activeFeature.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(String(format: "%.4f", activeScore))
+                        .font(.system(.subheadline, design: .monospaced))
+                        .fontWeight(.bold)
+                    Text("\(selectedDimensions)d cosine")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !dimScores.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Matryoshka Prefix Slice Scores (click to switch)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 6) {
+                        ForEach(Matryoshka.gemma2Dimensions, id: \.self) { dim in
+                            let val = dimScores[dim] ?? activeScore
+                            let isCurrent = (dim == selectedDimensions)
+                            Button {
+                                selectedDimensions = dim
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack {
+                                        Text("\(dim)d")
+                                            .font(.system(.caption2, design: .monospaced))
+                                            .fontWeight(isCurrent ? .bold : .regular)
+                                        Spacer()
+                                        Text(String(format: "%.3f", val))
+                                            .font(.system(.caption2, design: .monospaced))
+                                    }
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            Capsule()
+                                                .fill(Color.secondary.opacity(0.16))
+                                            Capsule()
+                                                .fill(isCurrent ? Color.accentColor : Color.secondary.opacity(0.6))
+                                                .frame(width: max(3, geo.size.width * Double(max(0, min(1, val)))))
+                                        }
+                                    }
+                                    .frame(height: 4)
+                                }
+                                .padding(6)
+                                .background(
+                                    isCurrent
+                                        ? Color.accentColor.opacity(0.16)
+                                        : Color.secondary.opacity(0.08)
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Label(
+                    hit.artifact.modelID.isEmpty ? "embeddinggemma-2-MLX-BF16" : hit.artifact.modelID,
+                    systemImage: "cube"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+                Spacer()
+
+                Text(ByteCountFormatter.string(fromByteCount: hit.artifact.fingerprint.byteCount, countStyle: .file))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 

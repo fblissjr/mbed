@@ -88,7 +88,9 @@ public final class IndexCoordinator: Sendable {
                     kind: kind,
                     url: fileURL.standardizedFileURL,
                     title: fileURL.lastPathComponent,
-                    fingerprint: fingerprint
+                    fingerprint: fingerprint,
+                    windowSamplingRaw: effectiveSampling.rawValue,
+                    modelID: effectiveModelID
                 )
                 let chunks = try await buildChunks(
                     for: artifact,

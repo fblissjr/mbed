@@ -213,10 +213,18 @@ public final class VectorStore: @unchecked Sendable {
         defer { lock.unlock() }
 
         let projectedQuery = Matryoshka.project(queryVector, dimensions: dimensions)
+        var projectedByDim = [Int: [Float]]()
+        for dim in Matryoshka.gemma2Dimensions {
+            projectedByDim[dim] = (dim == dimensions)
+                ? projectedQuery
+                : Matryoshka.project(queryVector, dimensions: dim)
+        }
+
         let sql = """
         SELECT
             a.id, a.collection_id, a.kind, a.url, a.title, a.byte_count, a.modified_ms, a.attributes_json,
-            c.id, c.span_json, c.vector_blob, c.thumbnail_jpeg, c.preview_text
+            c.id, c.span_json, c.vector_blob, c.thumbnail_jpeg, c.preview_text,
+            a.window_sampling, a.model_id
         FROM chunks c
         JOIN artifacts a ON a.id = c.artifact_id;
         """
@@ -264,7 +272,13 @@ public final class VectorStore: @unchecked Sendable {
             let floatPtr = blobPtr.bindMemory(to: Float.self, capacity: floatCount)
             let rawVector = Array(UnsafeBufferPointer(start: floatPtr, count: floatCount))
 
-            let score = Matryoshka.cosine(projectedQuery, rawVector, dimensions: dimensions)
+            var scoresByDim = [Int: Float]()
+            for dim in Matryoshka.gemma2Dimensions {
+                if let pq = projectedByDim[dim] {
+                    scoresByDim[dim] = Matryoshka.cosine(pq, rawVector, dimensions: dim)
+                }
+            }
+            let score = scoresByDim[dimensions] ?? Matryoshka.cosine(projectedQuery, rawVector, dimensions: dimensions)
 
             var thumb: Data?
             if let tPtr = sqlite3_column_blob(stmt, 11) {
@@ -274,8 +288,20 @@ public final class VectorStore: @unchecked Sendable {
             let preview: String? = sqlite3_column_type(stmt, 12) == SQLITE_NULL
                 ? nil
                 : String(cString: sqlite3_column_text(stmt, 12))
+            let windowSamplingRaw: String = sqlite3_column_type(stmt, 13) == SQLITE_NULL
+                ? ""
+                : String(cString: sqlite3_column_text(stmt, 13))
+            let modelID: String = sqlite3_column_type(stmt, 14) == SQLITE_NULL
+                ? ""
+                : String(cString: sqlite3_column_text(stmt, 14))
 
-            let match = SearchHit.SpanMatch(chunkID: chunkID, span: span, score: score, previewText: preview)
+            let match = SearchHit.SpanMatch(
+                chunkID: chunkID,
+                span: span,
+                score: score,
+                previewText: preview,
+                scoresByDimension: scoresByDim
+            )
 
             if var existing = groups[aID] {
                 existing.spanMatches.append(match)
@@ -299,6 +325,8 @@ public final class VectorStore: @unchecked Sendable {
                     url: URL(string: urlStr) ?? URL(fileURLWithPath: urlStr),
                     title: title,
                     fingerprint: ContentFingerprint(byteCount: bytes, modifiedUnixMs: mtime),
+                    windowSamplingRaw: windowSamplingRaw,
+                    modelID: modelID,
                     attributes: attrs
                 )
                 groups[aID] = GroupedAccumulator(
