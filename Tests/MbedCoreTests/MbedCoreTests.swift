@@ -606,6 +606,50 @@ struct MbedCoreTests {
         #endif
     }
 
+    @Test("Argmax-style per-tower ModelComputeOptions presets, memory split, and ANETowerInspector snapshot")
+    func testModelComputeOptionsAndANEInspector() {
+        let gpuAll = ModelComputeOptions.allMLXGPU
+        #expect(gpuAll.preset == .allMLXGPU)
+        #expect(!gpuAll.usesANE)
+        #expect(!gpuAll.isFullANE)
+        #expect(gpuAll.memorySplitMB == (aneMB: 0, gpuMB: 1488, cpuMB: 0))
+
+        let hybrid = ModelComputeOptions.hybridANETowers
+        #expect(hybrid.preset == .hybridANETowers)
+        #expect(hybrid.usesANE)
+        #expect(!hybrid.isFullANE)
+        // Vision (335 MB) + Audio (611 MB) = 946 MB on ANE; Text (542 MB) on MLX GPU
+        #expect(hybrid.memorySplitMB == (aneMB: 946, gpuMB: 542, cpuMB: 0))
+
+        let fullANE = ModelComputeOptions.allNeuralEngine
+        #expect(fullANE.preset == .allNeuralEngine)
+        #expect(fullANE.usesANE)
+        #expect(fullANE.isFullANE)
+        #expect(fullANE.memorySplitMB == (aneMB: 1488, gpuMB: 0, cpuMB: 0))
+        #expect(fullANE.shortSummaryBadge == "100% ANE (Vision · Audio · Text)")
+
+        var custom = ModelComputeOptions.hybridANETowers
+        custom[.textBackbone] = .cpuOnly
+        #expect(custom.preset == .custom)
+        #expect(custom.memorySplitMB == (aneMB: 946, gpuMB: 0, cpuMB: 542))
+
+        let snapshot = ANETowerInspector.statusSnapshot(options: hybrid)
+        #expect(snapshot.count == 3)
+        #expect(snapshot[0].component == .visionEncoder && snapshot[0].assignedUnit == .cpuAndNeuralEngine)
+        #expect(snapshot[1].component == .audioEncoder && snapshot[1].assignedUnit == .cpuAndNeuralEngine)
+        #expect(snapshot[2].component == .textBackbone && snapshot[2].assignedUnit == .mlxGPU)
+
+        // Verify 16 kHz HTK log-mel feature extractor for 1.0s of 440 Hz sine wave (16,000 samples -> 98 frames x 128 bins)
+        let pcm1s = (0..<16_000).map { i in
+            sin(2.0 * Float.pi * 440.0 * Float(i) / 16_000.0)
+        }
+        let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm1s)
+        #expect(mel != nil)
+        #expect(mel?.frameCount == 98)
+        #expect(mel?.features.count == 98 * 128)
+        #expect(mel?.features.allSatisfy(\.isFinite) == true)
+    }
+
     private static func writeSyntheticMP4(
         to url: URL,
         width: Int,

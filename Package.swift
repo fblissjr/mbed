@@ -3,8 +3,21 @@ import Foundation
 import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let candidateMLXRoots = [
+    "../../apple-mlx",
+    "../apple-mlx",
+    "../../mlx",
+]
+let resolvedMLXRoot: String = candidateMLXRoots.first { relRoot in
+    let cmakePath = packageRoot
+        .appendingPathComponent("\(relRoot)/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
+        .standardizedFileURL
+        .path
+    return FileManager.default.fileExists(atPath: cmakePath)
+} ?? "../../apple-mlx"
+
 let mlxCmakePath = packageRoot
-    .appendingPathComponent("../../mlx/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
+    .appendingPathComponent("\(resolvedMLXRoot)/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
     .standardizedFileURL
     .path
 
@@ -26,8 +39,8 @@ var coreTargetDependencies: [Target.Dependency] = []
 
 if enableNativeMLX {
     packageDependencies.append(contentsOf: [
-        .package(path: "../../mlx/mlx-swift"),
-        .package(path: "../../mlx/mlx-swift-lm"),
+        .package(path: "\(resolvedMLXRoot)/mlx-swift"),
+        .package(path: "\(resolvedMLXRoot)/mlx-swift-lm"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMajor(from: "1.1.0")
@@ -62,6 +75,7 @@ let package = Package(
                 .linkedFramework("Accelerate"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreGraphics"),
+                .linkedFramework("CoreML"),
                 .linkedFramework("CoreServices"),
                 .linkedFramework("ImageIO"),
                 .linkedFramework("PDFKit"),

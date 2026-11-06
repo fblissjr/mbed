@@ -171,22 +171,28 @@ public enum NativeMLXEmbeddingGemma2 {
 public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     public nonisolated let modelID: String
     public nonisolated let checkpointURL: URL
+    public nonisolated let computeOptions: ModelComputeOptions
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
     private let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
     private let customTokenizerLoader: (any TokenizerLoader)?
+    private let aneRuntime: ANECoreMLRuntime
+    private var cachedTokenizer: (any Tokenizer)?
     private var cachedEmbedder: MLXVLM.EmbeddingGemma2Embedding?
 
     /// Synchronous initializer used by `MbedApp` and `MbedCLI`; loads the model weights and
     /// tokenizer lazily on the first `embedBatch` call (`componentLoading: .onFirstUse`).
     public init(
         checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
         tokenizerLoader: (any TokenizerLoader)? = nil
     ) {
         self.checkpointURL = checkpointURL
+        self.computeOptions = computeOptions
         self.modelID = checkpointURL.lastPathComponent
         self.customTokenizerLoader = tokenizerLoader
+        self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: checkpointURL)
         self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: checkpointURL))
             ?? Self.fallbackDescriptor
     }
@@ -194,11 +200,14 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     /// Eager async initializer when the caller wants to pre-load `MLXVLM.EmbeddingGemma2Embedding` upfront.
     public init(
         modelDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
         tokenizerLoader: any TokenizerLoader
     ) async throws {
         self.checkpointURL = modelDirectory
+        self.computeOptions = computeOptions
         self.modelID = modelDirectory.lastPathComponent
         self.customTokenizerLoader = tokenizerLoader
+        self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: modelDirectory)
         self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: modelDirectory))
             ?? Self.fallbackDescriptor
         self.cachedEmbedder = try await MLXVLM.EmbeddingGemma2Embedding(
@@ -206,6 +215,16 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             tokenizerLoader: tokenizerLoader,
             componentLoading: .onFirstUse
         )
+    }
+
+    private func resolvedTokenizer() async throws -> any Tokenizer {
+        if let cachedTokenizer {
+            return cachedTokenizer
+        }
+        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader()
+        let tok = try await loader.load(from: checkpointURL)
+        self.cachedTokenizer = tok
+        return tok
     }
 
     private func resolvedEmbedder() async throws -> MLXVLM.EmbeddingGemma2Embedding {
@@ -282,7 +301,6 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
     ) async throws -> [EmbeddedOutput] {
-        let embedder = try await resolvedEmbedder()
         var outputs: [EmbeddedOutput] = []
         outputs.reserveCapacity(inputs.count)
 
@@ -335,14 +353,26 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                 }
             }
 
-            let primary = try await embedder.embed(
-                Self.buildVLMInput(parts: resolvedParts, title: item.title),
-                task: vlmTask,
-                dimensions: dimensions
-            )
+            let primary: [Float]
+            if windowedVideoRequest == nil,
+               let aneVec = try await tryEmbedOnANE(
+                   parts: resolvedParts,
+                   item: item,
+                   dimensions: dimensions ?? nativeDimensions
+               ) {
+                primary = aneVec
+            } else {
+                let embedder = try await resolvedEmbedder()
+                primary = try await embedder.embed(
+                    Self.buildVLMInput(parts: resolvedParts, title: item.title),
+                    task: vlmTask,
+                    dimensions: dimensions
+                )
+            }
 
             var windowVectors: [EmbeddedOutput.WindowVector] = []
             if let (videoURL, sampling) = windowedVideoRequest {
+                let embedder = try await resolvedEmbedder()
                 windowVectors = try await embedVideoWindows(
                     embedder: embedder,
                     videoURL: videoURL,
@@ -355,6 +385,143 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             outputs.append(EmbeddedOutput(vector: primary, windows: windowVectors))
         }
         return outputs
+    }
+
+    /// Attempts to run text, image, audio, and video inputs through `ANECoreMLRuntime` when the user
+    /// has assigned `textBackbone` (and `visionEncoder` / `audioEncoder` for media inputs) to
+    /// `.cpuAndNeuralEngine`, `.cpuAndGPU`, or `.cpuOnly`. Returns `nil` if the CoreML bundles are not
+    /// exported or the input exceeds the compiled ANE sequence buckets, seamlessly falling back to MLX.
+    private func tryEmbedOnANE(
+        parts: [ResolvedPart],
+        item: EmbeddingInput,
+        dimensions: Int
+    ) async throws -> [Float]? {
+        let hasImageOrVideo = parts.contains {
+            if case .image = $0 { return true }
+            if case .video = $0 { return true }
+            return false
+        }
+        let hasAudio = parts.contains {
+            if case .audio = $0 { return true }
+            return false
+        }
+        let usesANEMedia = (hasImageOrVideo && computeOptions.visionEncoder != .mlxGPU)
+            || (hasAudio && computeOptions.audioEncoder != .mlxGPU)
+
+        guard computeOptions.textBackbone != .mlxGPU || usesANEMedia else { return nil }
+        for part in parts {
+            switch part {
+            case .text:
+                break
+            case .image, .video:
+                guard computeOptions.visionEncoder != .mlxGPU else { return nil }
+            case .audio:
+                guard computeOptions.audioEncoder != .mlxGPU else { return nil }
+            }
+        }
+
+        let tokenizer = try await resolvedTokenizer()
+        let bosID = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }) ?? 2
+        let eosID = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>") ?? 1
+
+        var tokenIDs: [Int] = [bosID]
+        var softTokens: [Float] = []
+        var didPrependPrompt = false
+
+        for part in parts {
+            switch part {
+            case .text(let rawText):
+                let formatted: String
+                if !didPrependPrompt && item.hasNonWhitespaceText {
+                    didPrependPrompt = true
+                    if item.task == .document || item.task == .retrievalDocument {
+                        formatted = EmbeddingTask.documentPrompt(title: item.title, text: rawText)
+                    } else {
+                        formatted = item.task.promptPrefix + rawText
+                    }
+                } else {
+                    formatted = rawText
+                }
+                if !formatted.isEmpty {
+                    tokenIDs.append(contentsOf: tokenizer.encode(text: formatted, addSpecialTokens: false))
+                }
+            case .image(let imageURL):
+                guard let prep = ANECoreMLRuntime.prepareImagePixels(from: imageURL, forVideoBudget: false),
+                      let encoded = try await aneRuntime.encodeVision(
+                          pixels: prep.pixels,
+                          height: prep.height,
+                          width: prep.width,
+                          unit: computeOptions.visionEncoder
+                      )
+                else {
+                    return nil
+                }
+                tokenIDs.append(255999) // <boi>
+                tokenIDs.append(contentsOf: repeatElement(258880, count: encoded.tokenCount))
+                tokenIDs.append(258882) // <eoi>
+                softTokens.append(contentsOf: encoded.softTokens)
+            case .audio(let audioURL):
+                let pcm = try await ArtifactProcessor.decodeMonoPCM(for: audioURL)
+                guard let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm),
+                      let encoded = try await aneRuntime.encodeAudio(
+                          melFeatures: mel.features,
+                          frameCount: mel.frameCount,
+                          unit: computeOptions.audioEncoder
+                      )
+                else {
+                    return nil
+                }
+                tokenIDs.append(256000) // <boa>
+                tokenIDs.append(contentsOf: repeatElement(258881, count: encoded.tokenCount))
+                tokenIDs.append(258883) // <eoa>
+                softTokens.append(contentsOf: encoded.softTokens)
+            case .video(let videoURL):
+                let candidates = try await ArtifactProcessor.extractVideoCandidates(
+                    for: videoURL,
+                    sampling: .fps
+                )
+                let frameTimes = WindowPlanner.pickFPS(
+                    times: candidates.times,
+                    lo: 0,
+                    hi: min(candidates.duration, descriptor.maxWindowSeconds),
+                    fps: descriptor.videoFPS,
+                    maxFrames: descriptor.videoMaxFrames
+                )
+                let decoded = try await ArtifactProcessor.decodeVideoFrames(
+                    for: videoURL,
+                    at: frameTimes
+                )
+                guard !decoded.isEmpty else { return nil }
+                for frame in decoded {
+                    guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
+                          let encoded = try await aneRuntime.encodeVision(
+                              pixels: prep.pixels,
+                              height: prep.height,
+                              width: prep.width,
+                              unit: computeOptions.visionEncoder
+                          )
+                    else {
+                        return nil
+                    }
+                    tokenIDs.append(255999) // <boi>
+                    tokenIDs.append(contentsOf: repeatElement(258884, count: encoded.tokenCount))
+                    tokenIDs.append(258882) // <eoi>
+                    softTokens.append(contentsOf: encoded.softTokens)
+                }
+            }
+        }
+        tokenIDs.append(eosID)
+
+        let textFusionUnit: TowerComputeUnit = (computeOptions.textBackbone == .mlxGPU)
+            ? .cpuAndGPU
+            : computeOptions.textBackbone
+
+        return try await aneRuntime.encodeTextAndFuse(
+            tokenIDs: tokenIDs,
+            softTokens: softTokens.isEmpty ? nil : softTokens,
+            unit: textFusionUnit,
+            dimensions: dimensions
+        )
     }
 
     private func embedVideoWindows(

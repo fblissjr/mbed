@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 @Observable
 final class MbedViewModel {
     var selectedBackend: EngineBackend = NativeMLXEmbeddingGemma2.isAvailableInProcess ? .nativeMLX : .heylook
+    var computeOptions: ModelComputeOptions = .allMLXGPU
+    var componentComputeReports: [ANETowerInspector.ComponentComputeReport] = []
     var serverURLString: String = "http://127.0.0.1:8000"
     var checkpointPath: String = NativeMLXEmbeddingGemma2.defaultCheckpointURL.path
     var serverCapabilities: HeylookServerCapabilities?
@@ -117,7 +119,8 @@ final class MbedViewModel {
             case .nativeMLX:
                 #if canImport(MLXVLM)
                 activeEngine = MLXSwiftLMEmbeddingGemma2Engine(
-                    checkpointURL: URL(fileURLWithPath: checkpointPath)
+                    checkpointURL: URL(fileURLWithPath: checkpointPath),
+                    computeOptions: computeOptions
                 )
                 #else
                 let baseURL = URL(string: serverURLString) ?? URL(string: "http://127.0.0.1:8000")!
@@ -130,9 +133,48 @@ final class MbedViewModel {
             self.coordinator = IndexCoordinator(engine: activeEngine, store: vectorStore)
             refreshCounts()
             refreshWatchedFolders()
+            refreshComputeReports()
         } catch {
             statusMessage = "Store init failed: \(error.localizedDescription)"
         }
+    }
+
+    func refreshComputeReports() {
+        let dir = URL(fileURLWithPath: checkpointPath)
+        componentComputeReports = ANETowerInspector.statusSnapshot(
+            options: computeOptions,
+            checkpointDirectory: dir
+        )
+        Task {
+            var updated: [ANETowerInspector.ComponentComputeReport] = []
+            for comp in EmbeddingComponent.allCases {
+                let unit = computeOptions[comp]
+                if let report = try? await ANETowerInspector.inspectComputePlan(
+                    for: comp,
+                    assignedUnit: unit,
+                    in: dir
+                ) {
+                    updated.append(report)
+                }
+            }
+            if updated.count == EmbeddingComponent.allCases.count {
+                self.componentComputeReports = updated
+            }
+        }
+    }
+
+    func applyComputePreset(_ preset: ComputePreset) {
+        switch preset {
+        case .allMLXGPU:
+            computeOptions = .allMLXGPU
+        case .hybridANETowers:
+            computeOptions = .hybridANETowers
+        case .allNeuralEngine:
+            computeOptions = .allNeuralEngine
+        case .custom:
+            break
+        }
+        setupCoordinator()
     }
 
     func refreshCounts() {
@@ -403,6 +445,63 @@ struct SidebarView: View {
                 }
             }
 
+            if viewModel.selectedBackend == .nativeMLX {
+                Section("Compute Placement (ANE / GPU / CPU)") {
+                    Picker(
+                        "Preset",
+                        selection: Binding(
+                            get: { viewModel.computeOptions.preset },
+                            set: { viewModel.applyComputePreset($0) }
+                        )
+                    ) {
+                        ForEach(ComputePreset.allCases, id: \.self) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+
+                    ForEach(EmbeddingComponent.allCases) { component in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Picker(
+                                component.title,
+                                selection: Binding(
+                                    get: { viewModel.computeOptions[component] },
+                                    set: { newUnit in
+                                        viewModel.computeOptions[component] = newUnit
+                                        viewModel.setupCoordinator()
+                                    }
+                                )
+                            ) {
+                                ForEach(TowerComputeUnit.allCases, id: \.self) { unit in
+                                    Text(unit.shortBadge).tag(unit)
+                                }
+                            }
+                            HStack(spacing: 4) {
+                                Text("\(Int(component.parameterMillions.rounded()))M · \(component.estimatedMemoryMB) MB")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if let report = viewModel.componentComputeReports.first(where: { $0.component == component }),
+                                   viewModel.computeOptions[component] != .mlxGPU {
+                                    if report.isCompiledBundlePresent {
+                                        let pct = Int((report.aneResidencyFraction * 100).rounded())
+                                        Text(report.totalOperations > 0 ? "CoreML Ready (\(pct)% ANE ops)" : "CoreML Bundle Ready")
+                                            .font(.caption2)
+                                            .foregroundStyle(.green)
+                                    } else {
+                                        Text("Needs CoreML export (MLX fallback)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    ComputeMemorySplitBar(options: viewModel.computeOptions)
+                }
+            }
+
             Section("Index") {
                 Button("Add Files or Folders...") {
                     presentOpenPanel()
@@ -610,6 +709,13 @@ struct ScoringPipelineBanner: View {
                     label: "Query: \(viewModel.activeQueryTowersLabel)",
                     tint: .blue
                 )
+                if viewModel.selectedBackend == .nativeMLX {
+                    FeaturePill(
+                        icon: viewModel.computeOptions.usesANE ? "brain.head.profile" : "gpu",
+                        label: viewModel.computeOptions.shortSummaryBadge,
+                        tint: viewModel.computeOptions.usesANE ? .green : .indigo
+                    )
+                }
                 FeaturePill(
                     icon: "text.quote",
                     label: viewModel.activeQueryPromptLabel,
@@ -628,6 +734,56 @@ struct ScoringPipelineBanner: View {
                 )
             }
         }
+    }
+}
+
+struct ComputeMemorySplitBar: View {
+    let options: ModelComputeOptions
+
+    var body: some View {
+        let split = options.memorySplitMB
+        let total = max(1, Double(split.aneMB + split.gpuMB + split.cpuMB))
+        VStack(alignment: .leading, spacing: 5) {
+            GeometryReader { geo in
+                HStack(spacing: 2) {
+                    if split.aneMB > 0 {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.green)
+                            .frame(width: max(6, geo.size.width * (Double(split.aneMB) / total)))
+                    }
+                    if split.gpuMB > 0 {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.blue)
+                            .frame(width: max(6, geo.size.width * (Double(split.gpuMB) / total)))
+                    }
+                    if split.cpuMB > 0 {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.secondary)
+                            .frame(width: max(6, geo.size.width * (Double(split.cpuMB) / total)))
+                    }
+                }
+            }
+            .frame(height: 6)
+
+            HStack(spacing: 8) {
+                if split.aneMB > 0 {
+                    Label("ANE: \(split.aneMB) MB", systemImage: "brain.head.profile")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                }
+                if split.gpuMB > 0 {
+                    Label("GPU: \(split.gpuMB) MB", systemImage: "gpu")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                }
+                if split.cpuMB > 0 {
+                    Label("CPU: \(split.cpuMB) MB", systemImage: "cpu")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 }
 

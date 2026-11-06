@@ -7,11 +7,17 @@ set -euo pipefail
 #   2. xcodebuild (required by MLX Swift to compile Metal shaders into default.metallib)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MLX_SWIFT_DIR="$(cd "${REPO_ROOT}/../../mlx/mlx-swift" 2>/dev/null && pwd || true)"
+MLX_SWIFT_DIR=""
+for candidate in "${REPO_ROOT}/../../apple-mlx/mlx-swift" "${REPO_ROOT}/../apple-mlx/mlx-swift" "${REPO_ROOT}/../../mlx/mlx-swift"; do
+  if [[ -f "${candidate}/Source/Cmlx/mlx/CMakeLists.txt" ]]; then
+    MLX_SWIFT_DIR="$(cd "${candidate}" && pwd)"
+    break
+  fi
+done
 
 if [[ -z "${MLX_SWIFT_DIR}" || ! -f "${MLX_SWIFT_DIR}/Source/Cmlx/mlx/CMakeLists.txt" ]]; then
-  echo "error: mlx-swift C++ submodules are not initialized at ${MLX_SWIFT_DIR}/Source/Cmlx/mlx." >&2
-  echo "Run: git -C ../../mlx/mlx-swift submodule update --init --recursive" >&2
+  echo "error: mlx-swift C++ submodules are not initialized (checked ../../apple-mlx/mlx-swift and ../../mlx/mlx-swift)." >&2
+  echo "Run: git -C ../../apple-mlx/mlx-swift submodule update --init --recursive" >&2
   exit 1
 fi
 
