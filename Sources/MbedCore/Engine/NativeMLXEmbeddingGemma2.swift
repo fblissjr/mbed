@@ -12,7 +12,7 @@ import Tokenizers
 
 /// Standalone MLX Swift integration for `EmbeddingGemma 2` (`embedding_gemma2`).
 ///
-/// The local checkout at `/Users/fredbliss/mlx/mlx-swift-lm` includes first-party Apple support for
+/// Upstream `mlx-swift-lm` (`https://github.com/ml-explore/mlx-swift-lm`) includes first-party Apple support for
 /// `EmbeddingGemma 2`:
 /// - `MLXLMCommon.EmbeddingGemma2` & `EmbeddingGemma2Configuration` (`Libraries/MLXLMCommon/Models/EmbeddingGemma2.swift`)
 /// - `MLXLMCommon.Gemma4VisionModel` & `Gemma4AudioModel` (`Libraries/MLXLMCommon/Models/Gemma4Encoders.swift`),
@@ -162,10 +162,11 @@ public enum NativeMLXEmbeddingGemma2 {
 }
 
 #if canImport(MLXVLM)
-/// In-process `EmbeddingEngine` backed directly by `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding`.
+/// In-process `EmbeddingEngine` backed directly by `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding`
+/// and `ANECoreMLRuntime`.
 ///
-/// When `mbed` is linked with local `/Users/fredbliss/mlx/mlx-swift` and `/Users/fredbliss/mlx/mlx-swift-lm`
-/// (`MBED_ENABLE_NATIVE_MLX=1`), this engine runs `embeddinggemma-2-MLX-BF16` completely in-process
+/// When `mbed` is built with `mlx-swift` and `mlx-swift-lm` (`MBED_ENABLE_NATIVE_MLX=1`),
+/// this engine runs `embeddinggemma-2-MLX-BF16` completely in-process
 /// with zero Python or HTTP overhead, and uses `WindowPlanner` + `UserInput.Video.frames(...)` to
 /// embed 32-second video windows (`16s` overlapping stride, `fps` or duration-scaled `content`).
 public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
