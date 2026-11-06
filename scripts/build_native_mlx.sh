@@ -2,25 +2,10 @@
 set -euo pipefail
 
 # Build or test mbed with in-process MLXSwiftLMEmbeddingGemma2Engine enabled.
-# Requires:
-#   1. /Users/fredbliss/mlx/mlx-swift submodules initialized (Source/Cmlx/mlx and Source/Cmlx/mlx-c)
-#   2. xcodebuild (required by MLX Swift to compile Metal shaders into default.metallib)
+# Dependencies (mlx-swift, mlx-swift-lm, swift-transformers) are resolved from GitHub via SwiftPM.
+# Requires xcodebuild (required by MLX Swift to compile Metal shaders into default.metallib).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MLX_SWIFT_DIR=""
-for candidate in "${REPO_ROOT}/../../apple-mlx/mlx-swift" "${REPO_ROOT}/../apple-mlx/mlx-swift" "${REPO_ROOT}/../../mlx/mlx-swift"; do
-  if [[ -f "${candidate}/Source/Cmlx/mlx/CMakeLists.txt" ]]; then
-    MLX_SWIFT_DIR="$(cd "${candidate}" && pwd)"
-    break
-  fi
-done
-
-if [[ -z "${MLX_SWIFT_DIR}" || ! -f "${MLX_SWIFT_DIR}/Source/Cmlx/mlx/CMakeLists.txt" ]]; then
-  echo "error: mlx-swift C++ submodules are not initialized (checked ../../apple-mlx/mlx-swift and ../../mlx/mlx-swift)." >&2
-  echo "Run: git -C ../../apple-mlx/mlx-swift submodule update --init --recursive" >&2
-  exit 1
-fi
-
 ACTION="${1:-build}"
 shift || true
 export MBED_ENABLE_NATIVE_MLX=1

@@ -28,7 +28,7 @@ VISION_RESOLUTION_BUCKETS: list[tuple[int, int]] = [
     (768, 768),
 ]
 
-TEXT_SEQUENCE_BUCKETS: list[int] = [64, 320, 768, 1024]
+TEXT_SEQUENCE_BUCKETS: list[int] = [512]
 FP16_SAFE_RMS_PRESCALE: float = 0.0625  # 1/16: keeps (x * alpha)^2 < 65,504 for |x| <= 4,096
 
 
@@ -138,10 +138,9 @@ def export_vision_tower(checkpoint_dir: Path, state: dict, out_dir: Path, compil
             self.v_norm = ANESafeRMSNorm(head_dim, eps=eps, with_scale=False)
 
         def forward(self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
-            b, n, _ = x.shape
-            q = self.q_norm(self.q_proj(x).view(b, n, num_heads, head_dim)).transpose(1, 2)  # [B, H, N, D]
-            k = self.k_norm(self.k_proj(x).view(b, n, num_heads, head_dim)).transpose(1, 2)
-            v = self.v_norm(self.v_proj(x).view(b, n, num_heads, head_dim)).transpose(1, 2)
+            q = self.q_norm(self.q_proj(x).view(1, -1, num_heads, head_dim)).transpose(1, 2)  # [1, H, N, D]
+            k = self.k_norm(self.k_proj(x).view(1, -1, num_heads, head_dim)).transpose(1, 2)
+            v = self.v_norm(self.v_proj(x).view(1, -1, num_heads, head_dim)).transpose(1, 2)
 
             qx, qy = q[..., :32], q[..., 32:]
             kx, ky = k[..., :32], k[..., 32:]
@@ -158,7 +157,7 @@ def export_vision_tower(checkpoint_dir: Path, state: dict, out_dir: Path, compil
             ], dim=-1)
 
             attn = torch.matmul(q, k.transpose(-2, -1)).softmax(dim=-1)
-            out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(b, n, hidden_size)
+            out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(1, -1, hidden_size)
             return self.o_proj(out)
 
     class VisionBlock(nn.Module):
@@ -197,25 +196,27 @@ def export_vision_tower(checkpoint_dir: Path, state: dict, out_dir: Path, compil
 
         def forward(self, pixels: torch.Tensor) -> torch.Tensor:
             norm_px = 2.0 * (pixels - 0.5)
-            patches = self.patch_conv(norm_px)  # [B, 768, H_p, W_p]
-            b, c, hp, wp = patches.shape
+            patches = self.patch_conv(norm_px)  # [1, 768, H_p, W_p]
+            hp = patches.shape[2]
+            wp = patches.shape[3]
             patches = patches + self.pos_table_x[:, :, :, :wp] + self.pos_table_y[:, :, :hp, :]
-            seq = patches.flatten(2).transpose(1, 2)  # [B, N_patches, 768]
+            seq = patches.flatten(2).transpose(1, 2)  # [1, N_patches, 768]
 
-            # Build 2D Axial RoPE tables via 2D broadcast without gather
-            cx = self.cos_x_table[:, :, :, :wp, :].expand(1, 1, hp, wp, 32)
-            sx = self.sin_x_table[:, :, :, :wp, :].expand(1, 1, hp, wp, 32)
-            cy = self.cos_y_table[:, :, :hp, :, :].expand(1, 1, hp, wp, 32)
-            sy = self.sin_y_table[:, :, :hp, :, :].expand(1, 1, hp, wp, 32)
-            rope_cos = torch.cat([cx, cy], dim=-1).view(1, 1, hp * wp, 64)
-            rope_sin = torch.cat([sx, sy], dim=-1).view(1, 1, hp * wp, 64)
+            # Build 2D Axial RoPE tables via 2D broadcast without gather or dynamic view ints
+            grid_zero = patches[:, :1, :, :].unsqueeze(-1) * 0.0  # [1, 1, H_p, W_p, 1]
+            cx = self.cos_x_table[:, :, :, :wp, :] + grid_zero
+            sx = self.sin_x_table[:, :, :, :wp, :] + grid_zero
+            cy = self.cos_y_table[:, :, :hp, :, :] + grid_zero
+            sy = self.sin_y_table[:, :, :hp, :, :] + grid_zero
+            rope_cos = torch.cat([cx, cy], dim=-1).flatten(2, 3)  # [1, 1, N_patches, 64]
+            rope_sin = torch.cat([sx, sy], dim=-1).flatten(2, 3)  # [1, 1, N_patches, 64]
 
             for blk in self.blocks:
                 seq = blk(seq, rope_cos, rope_sin)
 
-            grid = seq.transpose(1, 2).view(b, c, hp, wp)
-            pooled = self.pool(grid).flatten(2).transpose(1, 2)  # [B, N_soft, 768]
-            return self.embed_proj(self.embed_norm(pooled))  # [B, N_soft, 512]
+            grid = seq.transpose(1, 2).reshape(1, hidden_size, hp, wp)
+            pooled = self.pool(grid).flatten(2).transpose(1, 2)  # [1, N_soft, 768]
+            return self.embed_proj(self.embed_norm(pooled))  # [1, N_soft, 512]
 
     model = EmbeddingGemma2VisionANEWrapper().eval()
 
@@ -323,13 +324,16 @@ def export_text_backbone(checkpoint_dir: Path, state: dict, out_dir: Path, compi
         def __init__(self, idx: int):
             super().__init__()
             ltype = layer_types[idx]
-            override = per_layer_cfg.get(str(idx), {})
-            self.head_dim = int(override.get("head_dim", default_head_dim))
-            self.kv_heads = int(override.get("num_key_value_heads", default_kv_heads))
+            lp = f"language_model.layers.{idx}"
+            sp = f"layers.{idx}"
+            q_w = get_tensor(state, f"{lp}.self_attn.q_proj.weight", f"{sp}.self_attn.q_proj.weight")
+            k_w = get_tensor(state, f"{lp}.self_attn.k_proj.weight", f"{sp}.self_attn.k_proj.weight")
             self.num_heads = num_heads
+            self.head_dim = int(q_w.shape[0] // self.num_heads)
+            self.kv_heads = int(k_w.shape[0] // self.head_dim)
             self.kv_repeats = self.num_heads // self.kv_heads
             self.is_global = (ltype == "full_attention")
-            rope_base = float(rope_params.get(ltype, {}).get("rope_theta", 10000.0))
+            rope_base = float(rope_params.get(ltype, {}).get("rope_theta", 1000000.0 if self.is_global else 10000.0))
 
             cos_1d, sin_1d = precompute_1d_rope(torch, max_seq=max_seq, head_dim=self.head_dim, base=rope_base)
             self.register_buffer("rope_cos", cos_1d.view(1, 1, max_seq, self.head_dim))
@@ -354,103 +358,89 @@ def export_text_backbone(checkpoint_dir: Path, state: dict, out_dir: Path, compi
             self.per_layer_input_gate = nn.Linear(hidden_size, ple_size, bias=False)
             self.per_layer_projection = nn.Linear(ple_size, hidden_size, bias=False)
             self.post_per_layer_input_norm = ANESafeRMSNorm(hidden_size, eps=eps)
+            self.ple_layer_proj = nn.Linear(hidden_size, ple_size, bias=False)
+            self.ple_layer_norm = ANESafeRMSNorm(ple_size, eps=eps)
+            self.ple_scale = 1.0 / math.sqrt(float(hidden_size))
             self.layer_scalar = nn.Parameter(torch.ones(1, dtype=torch.float32))
 
         def forward(
             self,
             x: torch.Tensor,
-            ple_in: torch.Tensor,
+            inputs_embeds: torch.Tensor,
             global_bias: torch.Tensor,
-            local_bias: torch.Tensor,
         ) -> torch.Tensor:
-            b, seq_len, _ = x.shape
             normed = self.input_layernorm(x)
-            q = self.q_norm(self.q_proj(normed).view(b, seq_len, self.num_heads, self.head_dim)).transpose(1, 2)
-            k = self.k_norm(self.k_proj(normed).view(b, seq_len, self.kv_heads, self.head_dim)).transpose(1, 2)
-            v = self.v_norm(self.v_proj(normed).view(b, seq_len, self.kv_heads, self.head_dim)).transpose(1, 2)
+            q = self.q_norm(self.q_proj(normed).view(1, max_seq, self.num_heads, self.head_dim)).transpose(1, 2)
+            k = self.k_norm(self.k_proj(normed).view(1, max_seq, self.kv_heads, self.head_dim)).transpose(1, 2)
+            v = self.v_norm(self.v_proj(normed).view(1, max_seq, self.kv_heads, self.head_dim)).transpose(1, 2)
 
-            rc = self.rope_cos[:, :, :seq_len, :]
-            rs = self.rope_sin[:, :, :seq_len, :]
-            q = q * rc + rotate_half(torch, q) * rs
-            k = k * rc + rotate_half(torch, k) * rs
+            q = q * self.rope_cos + rotate_half(torch, q) * self.rope_sin
+            k = k * self.rope_cos + rotate_half(torch, k) * self.rope_sin
 
-            if self.kv_repeats > 1:
-                k = k.unsqueeze(2).expand(b, self.kv_heads, self.kv_repeats, seq_len, self.head_dim).reshape(
-                    b, self.num_heads, seq_len, self.head_dim
-                )
-                v = v.unsqueeze(2).expand(b, self.kv_heads, self.kv_repeats, seq_len, self.head_dim).reshape(
-                    b, self.num_heads, seq_len, self.head_dim
-                )
+            # Pure 4D GQA head expansion (avoids 5D unsqueeze/tile ops that ANEC rejects to CPU)
+            if self.kv_heads == 2 and self.num_heads == 4:
+                k = torch.cat([k[:, 0:1, :, :], k[:, 0:1, :, :], k[:, 1:2, :, :], k[:, 1:2, :, :]], dim=1)
+                v = torch.cat([v[:, 0:1, :, :], v[:, 0:1, :, :], v[:, 1:2, :, :], v[:, 1:2, :, :]], dim=1)
 
-            bias = global_bias if self.is_global else local_bias
-            scores = torch.matmul(q, k.transpose(-2, -1)) + bias
+            scores = torch.matmul(q, k.transpose(-2, -1)) + global_bias
             attn = torch.softmax(scores, dim=-1)
-            attn_out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(b, seq_len, -1)
+            attn_out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(1, max_seq, self.num_heads * self.head_dim)
             x = x + self.post_attention_layernorm(self.o_proj(attn_out))
 
             ff = self.pre_feedforward_layernorm(x)
             act = torch.nn.functional.gelu(self.gate_proj(ff), approximate="tanh") * self.up_proj(ff)
             x = x + self.post_feedforward_layernorm(self.down_proj(act))
 
+            ple_in = self.ple_layer_norm(self.ple_layer_proj(inputs_embeds) * self.ple_scale)
             gated = torch.nn.functional.gelu(self.per_layer_input_gate(x), approximate="tanh") * ple_in
             x = x + self.post_per_layer_input_norm(self.per_layer_projection(gated))
             return x * self.layer_scalar
 
-    # Precompute static sliding-window mask pattern for max_seq
-    idx_grid = torch.arange(max_seq).unsqueeze(1) - torch.arange(max_seq).unsqueeze(0)
-    sliding_disallow = (idx_grid.abs() > sliding_window).to(torch.float32) * (-1e4)
-
     class EmbeddingGemma2TextANEWrapper(nn.Module):
         def __init__(self):
             super().__init__()
-            self.ple_scale = 1.0 / math.sqrt(float(hidden_size))
-            self.ple_proj = nn.Linear(hidden_size, num_layers * ple_size, bias=False)
-            self.ple_norm = ANESafeRMSNorm(ple_size, eps=eps)
-            self.register_buffer("sliding_bias_table", sliding_disallow.view(1, 1, max_seq, max_seq))
             self.layers = nn.ModuleList([TextLayer(i) for i in range(num_layers)])
             self.norm = ANESafeRMSNorm(hidden_size, eps=eps)
             self.embedding_projection = nn.Linear(hidden_size, embedding_dim, bias=False)
 
-        def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            # inputs_embeds: [1, L, 512], attention_mask: [1, L] (1.0 valid, 0.0 pad)
-            b, seq_len, _ = inputs_embeds.shape
-            ple_all = self.ple_norm(
-                (self.ple_proj(inputs_embeds) * self.ple_scale).view(b, seq_len, num_layers, ple_size)
-            )
-            # Key padding bias: [1, 1, 1, L], 0.0 for valid keys, -1e4 for padded keys
-            global_bias = (1.0 - attention_mask).view(b, 1, 1, seq_len) * (-1e4)
-            local_bias = global_bias + self.sliding_bias_table[:, :, :seq_len, :seq_len]
+        def forward(self, packed_input: torch.Tensor) -> torch.Tensor:
+            # Static-shape tensor: [1, 512, 513] = inputs_embeds [1, 512, 512] || attention_mask [1, 512, 1]
+            inputs_embeds = packed_input[:, :, :hidden_size]
+            mask_exp = packed_input[:, :, hidden_size:]  # [1, 512, 1]
+            # Key padding bias: [1, 1, 1, 512], 0.0 for valid keys, -1e4 for padded keys
+            global_bias = (1.0 - mask_exp).permute(0, 2, 1).unsqueeze(1) * (-1e4)
 
             h = inputs_embeds
-            for i, layer in enumerate(self.layers):
-                h = layer(h, ple_all[:, :, i, :], global_bias, local_bias)
+            for layer in self.layers:
+                h = layer(h, inputs_embeds, global_bias)
             h = self.norm(h)
 
-            mask_exp = attention_mask.unsqueeze(-1)  # [1, L, 1]
-            denom = torch.clamp(mask_exp.sum(dim=1), min=1e-6)
+            denom = torch.clamp(mask_exp.sum(dim=1), min=1.0)
             pooled = (h * mask_exp).sum(dim=1) / denom  # [1, 512]
             proj = self.embedding_projection(pooled)  # [1, 768]
             # Scale-safe L2 normalize
             proj_scaled = proj * FP16_SAFE_RMS_PRESCALE
-            norm = torch.rsqrt(torch.sum(proj_scaled * proj_scaled, dim=-1, keepdim=True) + 1e-12)
+            norm = torch.rsqrt(torch.sum(proj_scaled * proj_scaled, dim=-1, keepdim=True) + 1e-4)
             return proj_scaled * norm
 
     model = EmbeddingGemma2TextANEWrapper().eval()
 
     with torch.no_grad():
-        model.ple_proj.weight.copy_(get_tensor(
+        ple_proj_all = get_tensor(
             state,
             "language_model.ple.per_layer_model_projection.weight",
             "ple.per_layer_model_projection.weight",
-        ))
-        model.ple_norm.weight.copy_(get_tensor(
+        )
+        ple_norm_w = get_tensor(
             state,
             "language_model.ple.per_layer_projection_norm.weight",
             "ple.per_layer_projection_norm.weight",
-        ))
+        )
         for i, layer in enumerate(model.layers):
             lp = f"language_model.layers.{i}"
             sp = f"layers.{i}"
+            layer.ple_layer_proj.weight.copy_(ple_proj_all[i * ple_size : (i + 1) * ple_size, :])
+            layer.ple_layer_norm.weight.copy_(ple_norm_w)
             layer.input_layernorm.weight.copy_(get_tensor(state, f"{lp}.input_layernorm.weight", f"{sp}.input_layernorm.weight"))
             layer.post_attention_layernorm.weight.copy_(get_tensor(state, f"{lp}.post_attention_layernorm.weight", f"{sp}.post_attention_layernorm.weight"))
             layer.pre_feedforward_layernorm.weight.copy_(get_tensor(state, f"{lp}.pre_feedforward_layernorm.weight", f"{sp}.pre_feedforward_layernorm.weight"))
@@ -476,24 +466,28 @@ def export_text_backbone(checkpoint_dir: Path, state: dict, out_dir: Path, compi
         model.embedding_projection.weight.copy_(get_tensor(
             state, "language_model.embedding_projection.weight", "embedding_projection.weight"
         ))
+        # Clamp all parameters and buffers to IEEE-754 FP16 finite range [-65500, 65500] so ANEC never sees Inf
+        for name, param in model.named_parameters():
+            max_abs = float(param.abs().max().item())
+            if max_abs > 65500.0:
+                print(f"  [FP16 clamp] parameter {name} max_abs={max_abs:.1f} -> clamped to 65500.0")
+                param.clamp_(-65500.0, 65500.0)
+        for name, buf in model.named_buffers():
+            if buf.is_floating_point():
+                max_abs = float(buf.abs().max().item())
+                if max_abs > 65500.0:
+                    print(f"  [FP16 clamp] buffer {name} max_abs={max_abs:.1f} -> clamped to 65500.0")
+                    buf.clamp_(-65500.0, 65500.0)
 
-    ex_embeds = torch.zeros(1, 64, hidden_size, dtype=torch.float32)
-    ex_mask = torch.ones(1, 64, dtype=torch.float32)
-    traced = torch.jit.trace(model, (ex_embeds, ex_mask))
+    packed_dim = hidden_size + 1  # 512 embeds + 1 attention_mask
+    ex_packed = torch.zeros(1, max_seq, packed_dim, dtype=torch.float32)
+    ex_packed[:, :, hidden_size] = 1.0
+    traced = torch.jit.trace(model, (ex_packed,))
 
-    enum_embeds = ct.EnumeratedShapes(
-        shapes=[(1, seq_l, hidden_size) for seq_l in TEXT_SEQUENCE_BUCKETS],
-        default=(1, 64, hidden_size),
-    )
-    enum_mask = ct.EnumeratedShapes(
-        shapes=[(1, seq_l) for seq_l in TEXT_SEQUENCE_BUCKETS],
-        default=(1, 64),
-    )
     mlmodel = ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="inputs_embeds", shape=enum_embeds),
-            ct.TensorType(name="attention_mask", shape=enum_mask),
+            ct.TensorType(name="packed_input", shape=(1, max_seq, packed_dim)),
         ],
         outputs=[ct.TensorType(name="embedding")],
         convert_to="mlprogram",
@@ -638,35 +632,34 @@ def export_audio_tower(checkpoint_dir: Path, state: dict, out_dir: Path, compile
             mask_bias: torch.Tensor,
             gather_idx: torch.Tensor,
         ) -> torch.Tensor:
-            b = x.shape[0]
-            q_raw = self.q_proj(x).view(b, subsampled_len, num_heads, head_dim) * self.q_scale_vec
-            k_raw = self.k_proj(x).view(b, subsampled_len, num_heads, head_dim) * self.key_scale
-            v_raw = self.v_proj(x).view(b, subsampled_len, num_heads, head_dim)
+            q_raw = self.q_proj(x).view(1, subsampled_len, num_heads, head_dim) * self.q_scale_vec
+            k_raw = self.k_proj(x).view(1, subsampled_len, num_heads, head_dim) * self.key_scale
+            v_raw = self.v_proj(x).view(1, subsampled_len, num_heads, head_dim)
 
             q_pad = torch.nn.functional.pad(q_raw, (0, 0, 0, 0, 0, padded_len - subsampled_len))
-            q_blk = q_pad.view(b, block_count, chunk_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
+            q_blk = q_pad.view(1, block_count, chunk_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
 
             k_pad = torch.nn.functional.pad(k_raw, (0, 0, 0, 0, past_horizon, chunk_size - 1))
             v_pad = torch.nn.functional.pad(v_raw, (0, 0, 0, 0, past_horizon, chunk_size - 1))
-            k_blk = k_pad[:, gather_idx, :, :].view(b, block_count, context_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
-            v_blk = v_pad[:, gather_idx, :, :].view(b, block_count, context_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
+            k_blk = k_pad[:, gather_idx, :, :].view(1, block_count, context_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
+            v_blk = v_pad[:, gather_idx, :, :].view(1, block_count, context_size, num_heads, head_dim).permute(0, 3, 1, 2, 4)
 
             rel_k = self.relative_k_proj(rel_pos).view(13, num_heads, head_dim).permute(1, 2, 0)  # [H, D, 13]
-            scores = torch.matmul(q_blk, k_blk.transpose(-2, -1))  # [B, H, 63, 12, 24]
+            scores = torch.matmul(q_blk, k_blk.transpose(-2, -1))  # [1, H, 63, 12, 24]
 
-            term_bd = torch.matmul(q_blk.reshape(b, num_heads, padded_len, head_dim), rel_k).view(
-                b, num_heads, block_count, chunk_size, 13
+            term_bd = torch.matmul(q_blk.reshape(1, num_heads, padded_len, head_dim), rel_k).view(
+                1, num_heads, block_count, chunk_size, 13
             )
             term_bd_pad = torch.nn.functional.pad(term_bd, (0, context_size + 1 - 13)).view(
-                b, num_heads, block_count, chunk_size * (context_size + 1)
+                1, num_heads, block_count, chunk_size * (context_size + 1)
             )
             term_bd_shift = term_bd_pad[:, :, :, : chunk_size * context_size].view(
-                b, num_heads, block_count, chunk_size, context_size
+                1, num_heads, block_count, chunk_size, context_size
             )
 
             scores = torch.tanh((scores + term_bd_shift) / soft_cap) * soft_cap + mask_bias
             weights = torch.softmax(scores, dim=-1)
-            attended = torch.matmul(weights, v_blk).permute(0, 2, 3, 1, 4).reshape(b, padded_len, hidden_size)
+            attended = torch.matmul(weights, v_blk).permute(0, 2, 3, 1, 4).reshape(1, padded_len, hidden_size)
             return self.post(attended[:, :subsampled_len, :])
 
     class AudioConformerLayer(nn.Module):

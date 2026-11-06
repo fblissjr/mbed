@@ -2,25 +2,6 @@
 import Foundation
 import PackageDescription
 
-let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-let candidateMLXRoots = [
-    "../../apple-mlx",
-    "../apple-mlx",
-    "../../mlx",
-]
-let resolvedMLXRoot: String = candidateMLXRoots.first { relRoot in
-    let cmakePath = packageRoot
-        .appendingPathComponent("\(relRoot)/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
-        .standardizedFileURL
-        .path
-    return FileManager.default.fileExists(atPath: cmakePath)
-} ?? "../../apple-mlx"
-
-let mlxCmakePath = packageRoot
-    .appendingPathComponent("\(resolvedMLXRoot)/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt")
-    .standardizedFileURL
-    .path
-
 let env = ProcessInfo.processInfo.environment
 let isXcode = (env["__CFBundleIdentifier"]?.contains("Xcode") == true)
     || (env["XPC_SERVICE_NAME"]?.contains("Xcode") == true)
@@ -28,10 +9,7 @@ let enableNativeMLX: Bool = {
     if env["MBED_DISABLE_NATIVE_MLX"] == "1" || env["MBED_ENABLE_NATIVE_MLX"] == "0" {
         return false
     }
-    if env["MBED_ENABLE_NATIVE_MLX"] == "1" || isXcode {
-        return FileManager.default.fileExists(atPath: mlxCmakePath)
-    }
-    return false
+    return env["MBED_ENABLE_NATIVE_MLX"] == "1" || isXcode
 }()
 
 var packageDependencies: [Package.Dependency] = []
@@ -39,8 +17,14 @@ var coreTargetDependencies: [Target.Dependency] = []
 
 if enableNativeMLX {
     packageDependencies.append(contentsOf: [
-        .package(path: "\(resolvedMLXRoot)/mlx-swift"),
-        .package(path: "\(resolvedMLXRoot)/mlx-swift-lm"),
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift",
+            .upToNextMinor(from: "0.33.0")
+        ),
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift-lm",
+            branch: "main"
+        ),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMajor(from: "1.1.0")

@@ -14,19 +14,23 @@ struct MbedCLI {
         let dbURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MBED_DB"] ?? defaultDatabasePath())
 
         do {
-            let engine = makeEngine(args: args, serverURL: serverURL)
+            let computeOptions = parseComputeOptions(args: args)
+            let engine = makeEngine(args: args, serverURL: serverURL, computeOptions: computeOptions)
 
             switch subcommand {
             case "status":
                 let store = try VectorStore(databaseURL: dbURL)
                 let stats = try store.stats()
                 let watched = try store.listWatchedFolders()
+                let split = computeOptions.memorySplitMB
                 print("Database:          \(dbURL.path)")
                 print("Indexed artifacts: \(stats.artifactCount)")
                 print("Embedded chunks:   \(stats.chunkCount)")
                 print("Watched folders:   \(watched.count)")
                 print("Model ID:          \(engine.modelID) (\(engine.nativeDimensions)d)")
                 print("Native MLX linked: \(NativeMLXEmbeddingGemma2.isAvailableInProcess ? "yes" : "no (build with MBED_ENABLE_NATIVE_MLX=1)")")
+                print("Compute Placement: \(computeOptions.preset.label)")
+                print("Memory Split:      ANE \(split.aneMB) MB · GPU \(split.gpuMB) MB · CPU \(split.cpuMB) MB")
 
             case "watched":
                 let store = try VectorStore(databaseURL: dbURL)
@@ -111,6 +115,22 @@ struct MbedCLI {
                 print("Backbone:    \(desc.hiddenSize)d hidden -> \(desc.embeddingDim)d projection (\(desc.numHiddenLayers) layers)")
                 print("Vision:      image \(desc.imageMaxSoftTokens) soft tokens, video max \(desc.videoMaxFrames) frames @ \(desc.videoFPS) fps (\(desc.videoMaxSoftTokens) soft tokens/frame)")
                 print("Task prompts: \(desc.prompts.keys.sorted().joined(separator: ", "))")
+                print("Compute Placement (\(computeOptions.preset.label)):")
+                for comp in EmbeddingComponent.allCases {
+                    let assigned = computeOptions[comp]
+                    let paramBadge = String(format: "%.1fM · %d MB", comp.parameterMillions, comp.estimatedMemoryMB)
+                    let report = try? await ANETowerInspector.inspectComputePlan(
+                        for: comp,
+                        assignedUnit: assigned,
+                        in: checkpointURL
+                    )
+                    if let report, report.isCompiledBundlePresent {
+                        let pct = Int((report.aneResidencyFraction * 100.0).rounded())
+                        print("  - \(comp.title) (\(paramBadge)): \(assigned.label) -> \(pct)% ANE (\(report.aneOperationCount) ANE / \(report.gpuOperationCount) GPU / \(report.cpuOperationCount) CPU ops)")
+                    } else {
+                        print("  - \(comp.title) (\(paramBadge)): \(assigned.label) -> CoreML bundle not exported yet")
+                    }
+                }
 
             default:
                 printUsage()
@@ -121,7 +141,29 @@ struct MbedCLI {
         }
     }
 
-    private static func makeEngine(args: [String], serverURL: URL) -> any EmbeddingEngine {
+    private static func parseComputeOptions(args: [String]) -> ModelComputeOptions {
+        var options: ModelComputeOptions = .allMLXGPU
+        if let idx = args.firstIndex(of: "--compute"), idx + 1 < args.count {
+            let val = args[idx + 1].lowercased()
+            switch val {
+            case "ane", "all_ane", "all-ane", "100%":
+                options = .allNeuralEngine
+            case "hybrid", "hybrid_ane", "hybrid-ane":
+                options = .hybridANETowers
+            case "gpu", "all_gpu", "all-gpu", "mlx":
+                options = .allMLXGPU
+            default:
+                break
+            }
+        }
+        return options
+    }
+
+    private static func makeEngine(
+        args: [String],
+        serverURL: URL,
+        computeOptions: ModelComputeOptions
+    ) -> any EmbeddingEngine {
         var backend: EngineBackend = NativeMLXEmbeddingGemma2.isAvailableInProcess ? .nativeMLX : .heylook
         if let idx = args.firstIndex(of: "--engine"), idx + 1 < args.count {
             let val = args[idx + 1].lowercased()
@@ -141,7 +183,10 @@ struct MbedCLI {
             return HeylookMLXEngine(baseURL: serverURL)
         case .nativeMLX:
             #if canImport(MLXVLM)
-            return MLXSwiftLMEmbeddingGemma2Engine(checkpointURL: checkpointURL)
+            return MLXSwiftLMEmbeddingGemma2Engine(
+                checkpointURL: checkpointURL,
+                computeOptions: computeOptions
+            )
             #else
             fputs("Warning: Native MLX not linked (rebuild with MBED_ENABLE_NATIVE_MLX=1); falling back to heylook HTTP.\n", stderr)
             return HeylookMLXEngine(baseURL: serverURL)
@@ -185,11 +230,11 @@ struct MbedCLI {
         print("""
         mbed-cli — Multimodal EmbeddingGemma 2 CLI
         Usage:
-          mbed-cli status [--engine heylook|native]
+          mbed-cli status [--engine heylook|native] [--compute all_gpu|hybrid_ane|all_ane]
           mbed-cli watched
-          mbed-cli index <file-or-dir> [--sampling fps|content|off] [--audio-from-video] [--engine heylook|native] [--checkpoint <dir>]
-          mbed-cli search <query> [--dim 768|512|256|128] [--kind video|image|audio|text|code|document] [--task query|code|qa|fact|sts|clustering|classification] [--engine heylook|native]
-          mbed-cli inspect-checkpoint [checkpoint-dir]
+          mbed-cli index <file-or-dir> [--sampling fps|content|off] [--audio-from-video] [--engine heylook|native] [--compute all_gpu|hybrid_ane|all_ane] [--checkpoint <dir>]
+          mbed-cli search <query> [--dim 768|512|256|128] [--kind video|image|audio|text|code|document] [--task query|code|qa|fact|sts|clustering|classification] [--engine heylook|native] [--compute all_gpu|hybrid_ane|all_ane]
+          mbed-cli inspect-checkpoint [checkpoint-dir] [--compute all_gpu|hybrid_ane|all_ane]
         """)
     }
 }

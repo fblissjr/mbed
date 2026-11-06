@@ -354,12 +354,11 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             }
 
             let primary: [Float]
-            if windowedVideoRequest == nil,
-               let aneVec = try await tryEmbedOnANE(
-                   parts: resolvedParts,
-                   item: item,
-                   dimensions: dimensions ?? nativeDimensions
-               ) {
+            if let aneVec = try await tryEmbedOnANE(
+                parts: resolvedParts,
+                item: item,
+                dimensions: dimensions ?? nativeDimensions
+            ) {
                 primary = aneVec
             } else {
                 let embedder = try await resolvedEmbedder()
@@ -372,9 +371,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
 
             var windowVectors: [EmbeddedOutput.WindowVector] = []
             if let (videoURL, sampling) = windowedVideoRequest {
-                let embedder = try await resolvedEmbedder()
                 windowVectors = try await embedVideoWindows(
-                    embedder: embedder,
                     videoURL: videoURL,
                     sampling: sampling,
                     includeAudio: hasCompanionAudio,
@@ -525,7 +522,6 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     }
 
     private func embedVideoWindows(
-        embedder: MLXVLM.EmbeddingGemma2Embedding,
         videoURL: URL,
         sampling: VideoWindowSampling,
         includeAudio: Bool,
@@ -562,30 +558,43 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                 at: win.frameTimes
             )
             guard !decoded.isEmpty else { continue }
-            var tempAudioURL: URL?
-            defer {
-                if let tempAudioURL {
-                    try? FileManager.default.removeItem(at: tempAudioURL)
+
+            let vec: [Float]
+            if let aneVec = try await tryEmbedWindowOnANE(
+                frames: decoded,
+                pcmSamples: pcmSamples,
+                windowStart: win.start,
+                windowEnd: win.end,
+                dimensions: dimensions ?? nativeDimensions
+            ) {
+                vec = aneVec
+            } else {
+                var tempAudioURL: URL?
+                defer {
+                    if let tempAudioURL {
+                        try? FileManager.default.removeItem(at: tempAudioURL)
+                    }
                 }
-            }
-            if !pcmSamples.isEmpty,
-               let sliceWAV = ArtifactProcessor.encodeAudioSliceWAV(
-                   samples: pcmSamples,
-                   sampleRate: ArtifactProcessor.audioSampleRate,
-                   startSeconds: win.start,
-                   endSeconds: min(win.end, win.start + ArtifactProcessor.audioWindowSeconds)
-               ) {
-                let wavURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("mbed-win-audio-\(UUID().uuidString).wav")
-                if (try? sliceWAV.write(to: wavURL)) != nil {
-                    tempAudioURL = wavURL
+                if !pcmSamples.isEmpty,
+                   let sliceWAV = ArtifactProcessor.encodeAudioSliceWAV(
+                       samples: pcmSamples,
+                       sampleRate: ArtifactProcessor.audioSampleRate,
+                       startSeconds: win.start,
+                       endSeconds: min(win.end, win.start + ArtifactProcessor.audioWindowSeconds)
+                   ) {
+                    let wavURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("mbed-win-audio-\(UUID().uuidString).wav")
+                    if (try? sliceWAV.write(to: wavURL)) != nil {
+                        tempAudioURL = wavURL
+                    }
                 }
+                let embedder = try await resolvedEmbedder()
+                vec = try await embedder.embed(
+                    Self.buildWindowVLMInput(frames: decoded, audioWAVURL: tempAudioURL),
+                    task: task,
+                    dimensions: dimensions
+                )
             }
-            let vec = try await embedder.embed(
-                Self.buildWindowVLMInput(frames: decoded, audioWAVURL: tempAudioURL),
-                task: task,
-                dimensions: dimensions
-            )
             out.append(
                 EmbeddedOutput.WindowVector(
                     start: win.start,
@@ -596,6 +605,75 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
             )
         }
         return out
+    }
+
+    private func tryEmbedWindowOnANE(
+        frames: [(time: Double, image: CGImage)],
+        pcmSamples: [Float],
+        windowStart: Double,
+        windowEnd: Double,
+        dimensions: Int
+    ) async throws -> [Float]? {
+        guard computeOptions.visionEncoder != .mlxGPU else { return nil }
+        if !pcmSamples.isEmpty && computeOptions.audioEncoder == .mlxGPU {
+            return nil
+        }
+        let tokenizer = try await resolvedTokenizer()
+        let bosID = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }) ?? 2
+        let eosID = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>") ?? 1
+
+        var tokenIDs: [Int] = [bosID]
+        var softTokens: [Float] = []
+
+        for frame in frames {
+            guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
+                  let encoded = try await aneRuntime.encodeVision(
+                      pixels: prep.pixels,
+                      height: prep.height,
+                      width: prep.width,
+                      unit: computeOptions.visionEncoder
+                  )
+            else {
+                return nil
+            }
+            tokenIDs.append(255999) // <boi>
+            tokenIDs.append(contentsOf: repeatElement(258884, count: encoded.tokenCount))
+            tokenIDs.append(258882) // <eoi>
+            softTokens.append(contentsOf: encoded.softTokens)
+        }
+
+        if !pcmSamples.isEmpty {
+            let sr = Double(ArtifactProcessor.audioSampleRate)
+            let startIdx = max(0, Int((windowStart * sr).rounded()))
+            let endSec = min(windowEnd, windowStart + ArtifactProcessor.audioWindowSeconds)
+            let endIdx = min(pcmSamples.count, Int((endSec * sr).rounded()))
+            if endIdx > startIdx {
+                let slice = Array(pcmSamples[startIdx..<endIdx])
+                if let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: slice),
+                   let encodedAudio = try await aneRuntime.encodeAudio(
+                       melFeatures: mel.features,
+                       frameCount: mel.frameCount,
+                       unit: computeOptions.audioEncoder
+                   ) {
+                    tokenIDs.append(contentsOf: tokenizer.encode(text: " ", addSpecialTokens: false))
+                    tokenIDs.append(256000) // <boa>
+                    tokenIDs.append(contentsOf: repeatElement(258881, count: encodedAudio.tokenCount))
+                    tokenIDs.append(258883) // <eoa>
+                    softTokens.append(contentsOf: encodedAudio.softTokens)
+                }
+            }
+        }
+
+        tokenIDs.append(eosID)
+        let textFusionUnit: TowerComputeUnit = (computeOptions.textBackbone == .mlxGPU)
+            ? .cpuAndGPU
+            : computeOptions.textBackbone
+        return try await aneRuntime.encodeTextAndFuse(
+            tokenIDs: tokenIDs,
+            softTokens: softTokens.isEmpty ? nil : softTokens,
+            unit: textFusionUnit,
+            dimensions: dimensions
+        )
     }
 
     private static func mapTask(_ task: EmbeddingTask) -> MLXVLM.EmbeddingTask {

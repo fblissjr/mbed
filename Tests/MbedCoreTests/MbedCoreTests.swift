@@ -607,7 +607,7 @@ struct MbedCoreTests {
     }
 
     @Test("Argmax-style per-tower ModelComputeOptions presets, memory split, and ANETowerInspector snapshot")
-    func testModelComputeOptionsAndANEInspector() {
+    func testModelComputeOptionsAndANEInspector() async throws {
         let gpuAll = ModelComputeOptions.allMLXGPU
         #expect(gpuAll.preset == .allMLXGPU)
         #expect(!gpuAll.usesANE)
@@ -648,6 +648,18 @@ struct MbedCoreTests {
         #expect(mel?.frameCount == 98)
         #expect(mel?.features.count == 98 * 128)
         #expect(mel?.features.allSatisfy(\.isFinite) == true)
+
+        if snapshot.allSatisfy(\.isCompiledBundlePresent),
+           let vec = try? await ANECoreMLRuntime().encodeTextAndFuse(
+               tokenIDs: [2, 108, 235, 1984, 1],
+               unit: .cpuAndNeuralEngine,
+               dimensions: 768
+           ) {
+            #expect(vec.count == 768)
+            #expect(vec.allSatisfy { $0.isFinite })
+            let norm = sqrt(vec.reduce(0) { $0 + $1 * $1 })
+            #expect(abs(norm - 1.0) < 1e-3)
+        }
     }
 
     private static func writeSyntheticMP4(

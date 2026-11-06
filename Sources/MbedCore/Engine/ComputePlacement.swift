@@ -358,7 +358,7 @@ public actor ANECoreMLRuntime {
         [960, 672],
         [768, 768],
     ]
-    public static let supportedTextSequenceBuckets: [Int] = [64, 320, 768, 1024]
+    public static let supportedTextSequenceBuckets: [Int] = [512]
     public static let audioMelFrames: Int = 2999
     public static let audioMelBins: Int = 128
     public static let hiddenSize: Int = 512
@@ -671,16 +671,13 @@ public actor ANECoreMLRuntime {
             return nil
         }
 
-        let embedsShape: [NSNumber] = [1, NSNumber(value: bucketLen), NSNumber(value: Self.hiddenSize)]
-        let maskShape: [NSNumber] = [1, NSNumber(value: bucketLen)]
-        let embedsArray = try MLMultiArray(shape: embedsShape, dataType: .float32)
-        let maskArray = try MLMultiArray(shape: maskShape, dataType: .float32)
+        let packedWidth = Self.hiddenSize + 1 // 512 embeds + 1 attention_mask
+        let packedShape: [NSNumber] = [1, NSNumber(value: bucketLen), NSNumber(value: packedWidth)]
+        let packedArray = try MLMultiArray(shape: packedShape, dataType: .float32)
 
-        let totalEmbedFloats = bucketLen * Self.hiddenSize
-        let embedsPtr = embedsArray.dataPointer.bindMemory(to: Float.self, capacity: totalEmbedFloats)
-        let maskPtr = maskArray.dataPointer.bindMemory(to: Float.self, capacity: bucketLen)
-        embedsPtr.initialize(repeating: 0, count: totalEmbedFloats)
-        maskPtr.initialize(repeating: 0, count: bucketLen)
+        let totalPackedFloats = bucketLen * packedWidth
+        let packedPtr = packedArray.dataPointer.bindMemory(to: Float.self, capacity: totalPackedFloats)
+        packedPtr.initialize(repeating: 0, count: totalPackedFloats)
 
         let rowBytes = Self.hiddenSize * MemoryLayout<UInt16>.size
         var softCursor = 0
@@ -692,8 +689,8 @@ public actor ANECoreMLRuntime {
             }
             let maxVocab = rawTokBuffer.count / rowBytes
             for (pos, tokID) in tokenIDs.enumerated() {
-                maskPtr[pos] = 1.0
-                let dstRow = embedsPtr.advanced(by: pos * Self.hiddenSize)
+                let dstRow = packedPtr.advanced(by: pos * packedWidth)
+                dstRow[Self.hiddenSize] = 1.0 // attention_mask = 1.0
                 if softTokenIDs.contains(tokID), let softTokens, softCursor < totalSoftRows {
                     let srcOffset = softCursor * Self.hiddenSize
                     for d in 0..<Self.hiddenSize {
@@ -710,8 +707,7 @@ public actor ANECoreMLRuntime {
         }
 
         let provider = try MLDictionaryFeatureProvider(dictionary: [
-            "inputs_embeds": embedsArray,
-            "attention_mask": maskArray,
+            "packed_input": packedArray
         ])
         let outFeatures = try Self.runSyncPrediction(model: textModel, provider: provider)
         guard let outArray = outFeatures.featureValue(for: "embedding")?.multiArrayValue else {
